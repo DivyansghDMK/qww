@@ -9,6 +9,7 @@ from PyQt5.QtWidgets import (
     QSizePolicy,
     QApplication,
     QFileDialog,
+    QLineEdit,
 )
 from PyQt5.QtCore import Qt
 import os
@@ -16,6 +17,7 @@ import json
 import datetime
 import sys
 import shutil
+import requests
 
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -23,6 +25,10 @@ HISTORY_FILE = os.path.join(BASE_DIR, "ecg_history.json")
 ECG_DATA_FILE = os.path.join(BASE_DIR, "ecg_data.txt")
 REPORTS_INDEX_FILE = os.path.join(BASE_DIR, "reports", "index.json")
 REPORTS_DIR = os.path.join(BASE_DIR, "reports")
+
+# Backend API configuration
+BACKEND_API_URL = "https://your-backend-api.com/api/reports"  # Replace with actual backend URL
+API_TIMEOUT = 30  # seconds
 
 
 class HistoryWindow(QDialog):
@@ -32,6 +38,7 @@ class HistoryWindow(QDialog):
         super().__init__(parent)
         self.setWindowTitle("ECG Report History")
         self.username = username
+        self.all_history_entries = []  # Store all entries for filtering
         
         # Make window responsive to screen size
         screen = QApplication.desktop().screenGeometry()
@@ -45,6 +52,18 @@ class HistoryWindow(QDialog):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(10)
+
+        # Search bar
+        search_layout = QHBoxLayout()
+        search_label = QPushButton("Search by Name:")
+        search_label.setStyleSheet("background: #007bff; color: white; border-radius: 5px; padding: 5px 10px;")
+        search_label.setEnabled(False)  # Make it look like a label
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Enter patient name to search...")
+        self.search_input.textChanged.connect(self.filter_table)
+        search_layout.addWidget(search_label)
+        search_layout.addWidget(self.search_input)
+        layout.addLayout(search_layout)
 
         self.table = QTableWidget()
         self.table.setColumnCount(10)
@@ -96,6 +115,13 @@ class HistoryWindow(QDialog):
         self.export_all_btn.clicked.connect(self.export_all_reports)
         btn_row.addWidget(self.export_all_btn)
 
+        self.send_review_btn = QPushButton("Send for Review")
+        self.send_review_btn.setStyleSheet(
+            "background: #17a2b8; color: white; border-radius: 10px; padding: 6px 18px;"
+        )
+        self.send_review_btn.clicked.connect(self.send_report_for_review)
+        btn_row.addWidget(self.send_review_btn)
+
         btn_row.addStretch(1)
 
         self.close_btn = QPushButton("Close")
@@ -110,7 +136,7 @@ class HistoryWindow(QDialog):
         self.table.horizontalHeader().sectionResizeMode(self.table.horizontalHeader().Stretch)
 
     def load_history(self):
-        """Load history entries (preferring ecg_history.json) into the table."""
+        """Load history entries from both ecg_history.json and reports/index.json into the table."""
         self.table.setRowCount(0)
 
         history_entries = []
@@ -125,6 +151,51 @@ class HistoryWindow(QDialog):
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to load history from ecg_history.json: {e}")
                 history_entries = []
+
+        # Also load from reports/index.json (same source as Recent Reports)
+        reports_index_entries = []
+        if os.path.exists(REPORTS_INDEX_FILE):
+            try:
+                with open(REPORTS_INDEX_FILE, "r", encoding="utf-8") as f:
+                    reports_index_entries = json.load(f)
+                if not isinstance(reports_index_entries, list):
+                    reports_index_entries = []
+            except Exception as e:
+                print(f"Failed to load reports index: {e}")
+                reports_index_entries = []
+
+        # Convert reports index entries to history format
+        for entry in reports_index_entries:
+            # Only include ECG Report entries (not detailed metadata)
+            if 'filename' in entry and 'title' in entry:
+                # Determine report type from title or filename
+                title = entry.get('title', 'ECG Report')
+                filename = entry.get('filename', '').lower()
+                
+                if 'hyper' in filename:
+                    report_type = "Hyperkalemia"
+                elif 'hrv' in filename:
+                    report_type = "HRV"
+                else:
+                    report_type = "ECG"
+                
+                # Only include ECG, HRV, and Hyperkalemia reports
+                if report_type in ["ECG", "HRV", "Hyperkalemia"]:
+                    history_entry = {
+                        "date": entry.get('date', ''),
+                        "time": entry.get('time', ''),
+                        "report_type": report_type,
+                        "Org.": entry.get('org', ''),
+                        "doctor": entry.get('doctor', ''),
+                        "patient_name": entry.get('patient', ''),
+                        "age": entry.get('age', ''),
+                        "gender": entry.get('gender', ''),
+                        "height": entry.get('height', ''),
+                        "weight": entry.get('weight', ''),
+                        "report_file": os.path.join(REPORTS_DIR, entry.get('filename', '')),
+                        "username": entry.get('username', '')
+                    }
+                    history_entries.append(history_entry)
 
         # Fallback: basic patient list (older flow without report_type)
         if not history_entries:
@@ -172,9 +243,11 @@ class HistoryWindow(QDialog):
                 }
                 history_entries.append(entry)
 
-        # Normalize and populate table
+        # Store all entries and filter for ECG, 12 HRV, and Hyperkalemia reports
+        self.all_history_entries = []
         for entry in history_entries:
-            if self.username and entry.get("username") != self.username:
+            # Apply username filtering - if username is specified, only show reports for that user
+            if self.username and entry.get("username") and entry.get("username") != self.username:
                 continue
 
             report_file = entry.get("report_file", "") or ""
@@ -189,8 +262,25 @@ class HistoryWindow(QDialog):
                     report_type = "ECG"
                 else:
                     report_type = "ECG"
-            entry["report_type"] = report_type
-            self.add_row(entry)
+            
+            # Filter for ECG, 12 HRV, and Hyperkalemia reports
+            if report_type in ["ECG", "HRV", "Hyperkalemia"]:
+                entry["report_type"] = report_type
+                self.all_history_entries.append(entry)
+                self.add_row(entry)
+
+    def filter_table(self):
+        """Filter table rows based on search input for patient name."""
+        search_text = self.search_input.text().strip().lower()
+        
+        # Clear current table
+        self.table.setRowCount(0)
+        
+        # Re-add entries that match the search
+        for entry in self.all_history_entries:
+            patient_name = entry.get("patient_name", "").lower()
+            if search_text == "" or search_text in patient_name:
+                self.add_row(entry)
 
     def _get_report_datetime(self, patient_name, reports_index):
         """Get the actual date/time when report was generated for a patient."""
@@ -465,6 +555,158 @@ class HistoryWindow(QDialog):
             )
             import traceback
             traceback.print_exc()
+
+    def send_report_for_review(self):
+        """Send the selected report for review to backend API."""
+        row = self.table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "Send for Review", "Please select a report row first.")
+            return
+
+        try:
+            # Get report details from selected row
+            report_data = self.get_report_data_from_row(row)
+            if not report_data:
+                QMessageBox.warning(self, "Send for Review", "Could not get report details.")
+                return
+
+            # Show confirmation dialog
+            reply = QMessageBox.question(
+                self, 
+                "Send for Review",
+                f"Send the following report for review?\n\n"
+                f"Patient: {report_data['patient_name']}\n"
+                f"Report Type: {report_data['report_type']}\n"
+                f"Date: {report_data['date']}\n"
+                f"Doctor: {report_data['doctor']}",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+
+            if reply == QMessageBox.No:
+                return
+
+            # Show progress
+            QMessageBox.information(self, "Sending", "Sending report for review...")
+            
+            # Send to backend API
+            success = self.send_to_backend_api(report_data)
+            
+            if success:
+                QMessageBox.information(
+                    self, 
+                    "Success", 
+                    "Report sent for review successfully!\n\nThe doctor will be notified."
+                )
+            else:
+                QMessageBox.warning(
+                    self, 
+                    "Failed", 
+                    "Failed to send report for review.\n\nPlease check your internet connection and try again."
+                )
+
+        except Exception as e:
+            QMessageBox.critical(
+                self, 
+                "Error", 
+                f"An error occurred while sending the report:\n\n{str(e)}"
+            )
+
+    def get_report_data_from_row(self, row):
+        """Extract report data from the selected table row."""
+        try:
+            # Get data from table cells
+            date_item = self.table.item(row, 0)
+            time_item = self.table.item(row, 1)
+            org_item = self.table.item(row, 2)
+            doctor_item = self.table.item(row, 3)
+            patient_item = self.table.item(row, 4)
+            age_item = self.table.item(row, 5)
+            gender_item = self.table.item(row, 6)
+            height_item = self.table.item(row, 7)
+            weight_item = self.table.item(row, 8)
+            report_type_item = self.table.item(row, 9)
+
+            # Get report file path from stored data
+            first_item = self.table.item(row, 0)
+            report_file = first_item.data(Qt.UserRole) if first_item else ""
+
+            # Find corresponding history entry for more details
+            patient_name = patient_item.text() if patient_item else ""
+            history_entry = None
+            for entry in self.all_history_entries:
+                if entry.get("patient_name", "") == patient_name:
+                    history_entry = entry
+                    break
+
+            report_data = {
+                "date": date_item.text() if date_item else "",
+                "time": time_item.text() if time_item else "",
+                "organization": org_item.text() if org_item else "",
+                "doctor": doctor_item.text() if doctor_item else "",
+                "patient_name": patient_name,
+                "age": age_item.text() if age_item else "",
+                "gender": gender_item.text() if gender_item else "",
+                "height": height_item.text() if height_item else "",
+                "weight": weight_item.text() if weight_item else "",
+                "report_type": report_type_item.text() if report_type_item else "",
+                "report_file_path": report_file,
+                "username": self.username,
+                "timestamp": datetime.datetime.now().isoformat()
+            }
+
+            # Add additional data from history entry if available
+            if history_entry:
+                report_data.update({
+                    "report_file": history_entry.get("report_file", ""),
+                    "original_entry": history_entry
+                })
+
+            return report_data
+
+        except Exception as e:
+            print(f"Error getting report data from row: {e}")
+            return None
+
+    def send_to_backend_api(self, report_data):
+        """Send report data to backend API."""
+        try:
+            # Prepare payload for backend
+            payload = {
+                "action": "send_for_review",
+                "report": report_data,
+                "metadata": {
+                    "source": "ecg_monitor",
+                    "version": "1.0",
+                    "sent_by": self.username or "unknown"
+                }
+            }
+
+            # Make API request
+            response = requests.post(
+                BACKEND_API_URL,
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "ECG-Monitor/1.0"
+                },
+                timeout=API_TIMEOUT
+            )
+
+            # Check response
+            if response.status_code == 200:
+                result = response.json()
+                return result.get("success", False)
+            else:
+                print(f"API Error: Status {response.status_code}, Response: {response.text}")
+                return False
+
+        except requests.exceptions.RequestException as e:
+            print(f"Network error: {e}")
+            return False
+        except Exception as e:
+            print(f"API call error: {e}")
+            return False
 
 
 def append_history_entry(patient_details, report_file_path, report_type="ECG", username=None):

@@ -393,7 +393,7 @@ class ExpandedLeadView(QDialog):
         self.respiration_ax = None  # Secondary axis for respiration (if needed)
         self.respiration_ylim = None  # Dynamic Y-limits for respiration (percentile-based)
         self.respiration_data = None  # Respiration waveform data (if available)
-        self.use_clean_view = True
+        self.use_clean_view = False  # Default to False (unchecked)
         self.show_respiration = True
         self.show_median_overlay = True
         self.show_markers = False
@@ -734,9 +734,10 @@ class ExpandedLeadView(QDialog):
 
         # Toggles (display-only UX)
         self.clean_view_toggle = QCheckBox("Clean display")
-        self.clean_view_toggle.setChecked(True)
+        self.clean_view_toggle.setChecked(False)  # Default to unchecked
         self.clean_view_toggle.stateChanged.connect(self.toggle_clean_view)
-        control_layout.addWidget(self.clean_view_toggle)
+        # Hide the clean display toggle from user interface
+        self.clean_view_toggle.hide()
 
         self.resp_toggle = QCheckBox("Respiration")
         self.resp_toggle.setChecked(True)
@@ -1431,7 +1432,8 @@ class ExpandedLeadView(QDialog):
             try:
                 # Mode toggle (default clean)
                 if self.use_clean_view:
-                    display_signal = self._apply_display_bandpass(display_signal, fs=self.sampling_rate, low=0.05, high=40.0)
+                    # Clean display: Just remove respiration, don't apply bandpass filtering
+                    # This keeps waves straight like live display
                     display_signal = self._remove_respiration_display(display_signal, fs=self.sampling_rate, window_sec=2.0)
                 # clinical view leaves display_signal untouched
             except Exception as filter_error:

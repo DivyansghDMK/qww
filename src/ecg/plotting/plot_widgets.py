@@ -68,6 +68,9 @@ def create_plot_grid(plot_area: QWidget, leads: List[str], click_handler: Callab
                 vb.setRange(xRange=(0.0, 10.0), padding=0)
                 # Lock X-axis limits to prevent any changes
                 vb.setLimits(xMin=0.0, xMax=10.0)
+                # Enable better rendering for smooth curves
+                vb.setAspectLocked(False)
+                vb.enableAutoRange(axis='y', enable=False)
             except Exception:
                 pass
         
@@ -104,6 +107,7 @@ def update_plot_data(plot_widget: pg.PlotWidget, data_line, data: List[float], t
         
         # Update the plot line
         data_line.setData(time_axis, data)
+        
     except Exception as e:
         print(f"Error updating plot data: {e}")
 
