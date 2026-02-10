@@ -56,6 +56,7 @@ from typing import Deque, Dict, List, Tuple, Optional
 from ecg.recording import ECGMenu
 from scipy.signal import find_peaks, iirnotch, filtfilt
 from scipy.ndimage import gaussian_filter1d
+from scipy.interpolate import interp1d
 from utils.settings_manager import SettingsManager
 from utils.localization import translate_text
 from .demo_manager import DemoManager
@@ -673,7 +674,7 @@ class ECGTestPage(QWidget):
         self.SMOOTH_SIGMA = 0.8
         self.INTERP_FACTOR = 4
         # 50 Hz NOTCH FILTER
-        self.b_notch, self.a_notch = iirnotch(w0=10.0, Q=30.0, fs=self.SAMPLE_RATE)
+        self.b_notch, self.a_notch = iirnotch(w0=50.0, Q=30.0, fs=self.SAMPLE_RATE)
 
         # Track overlay state and current layout (12:1 vs 6:2)
         self._overlay_active = False
@@ -7813,9 +7814,16 @@ class ECGTestPage(QWidget):
             self._overlay_canvas.draw_idle()
 
     def interpolate(self, signal, factor):
-        x = np.arange(len(signal))
-        xi = np.linspace(0, len(signal) - 1, len(signal) * factor)
-        return np.interp(xi, x, signal)
+        try:
+            x = np.arange(len(signal))
+            f = interp1d(x, signal, kind='cubic')
+            xi = np.linspace(0, len(signal) - 1, len(signal) * factor)
+            return f(xi)
+        except Exception:
+            # Fallback to linear
+            x = np.arange(len(signal))
+            xi = np.linspace(0, len(signal) - 1, len(signal) * factor)
+            return np.interp(xi, x, signal)
 
     def set_display_mode(self, mode):
         """Set the display mode: 'scroll' or 'sweep'"""
@@ -7852,6 +7860,13 @@ class ECGTestPage(QWidget):
                                 if len(raw) > 30: # Only filter if enough data
                                     raw = filtfilt(self.b_notch, self.a_notch, raw)
                             except Exception as e:
+                                pass
+                            
+                            # --- PIPELINE STEP 2: Gaussian Smoothing ---
+                            try:
+                                if len(raw) > 5:
+                                    raw = gaussian_filter1d(raw, sigma=self.SMOOTH_SIGMA)
+                            except Exception:
                                 pass
                             # ------------------------------------------
 
@@ -7953,15 +7968,6 @@ class ECGTestPage(QWidget):
                             if src.size < 2:
                                 resampled = np.zeros(display_len)
                             else:
-                                # --- PIPELINE STEP 2: Gaussian Smoothing ---
-                                try:
-                                    if len(src) > 5:
-                                        # Use standard sigma=0.8 from standalone script
-                                        src = gaussian_filter1d(src, sigma=self.SMOOTH_SIGMA)
-                                except Exception:
-                                    pass
-                                # -------------------------------------------
-
                                 # --- PIPELINE STEP 3: Interpolation ---
                                 try:
                                     # Use fixed factor interpolation (4x) for high-res smoothness
