@@ -1,10 +1,16 @@
 {
-  "timestamp": "2026-02-18 13:56:27",
+  "timestamp": "2026-02-19 12:39:47",
   "findings": [
+    "Rhythm Analysis",
     "Normal heart rate",
     "Normal PR interval",
     "Normal QRS duration",
-    "Normal QTc interval"
+    "Normal QTc interval",
+    "Low HRV"
   ],
-  "recommendations": []
+  "recommendations": [
+    "Review detected arrhythmia pattern, consult physician if persistent",
+    "Ensure adequate rest and stress management",
+    "Consider relaxation techniques, adequate sleep, and regular exercise"
+  ]
 }

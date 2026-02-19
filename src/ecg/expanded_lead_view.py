@@ -143,8 +143,9 @@ class PQRSTAnalyzer:
             threshold = mean_mwa + 0.3 * std_mwa
             
             # Minimum distance between peaks - adaptive based on expected heart rate
-            # Allow for heart rates from 40-200 bpm
-            min_distance_samples = max(3, int(0.2 * self.fs))  # At least 200ms between peaks
+            # FIX-ELV1: Was 0.2*fs (200ms) = exactly RR at 300 BPM → missed every
+            # other peak → false 150 BPM.  Use 0.12*fs (120ms) for up to 500 BPM.
+            min_distance_samples = max(3, int(0.12 * self.fs))  # At least 120ms between peaks
             
             # Try to find peaks with the threshold
             peaks, properties = find_peaks(mwa, height=threshold, distance=min_distance_samples)
@@ -1418,44 +1419,86 @@ class ExpandedLeadView(QDialog):
             return
 
         try:
-            # Use the full ecg_data for analysis, not just the visible window
-            # Apply a display-like bandpass filter for analysis to remove DC drift and high-freq noise
-            # This is a copy of the display filter, but applied to the full data for consistency
+            # FIX-ELV2: Pull metrics from parent's authoritative calculation
+            # so that expanded view and 12-lead view show identical numbers.
+            parent = self.parent() if hasattr(self, 'parent') and callable(self.parent) else None
+            parent_metrics = None
+            if parent and hasattr(parent, 'get_current_metrics'):
+                try:
+                    parent_metrics = parent.get_current_metrics()
+                except Exception:
+                    parent_metrics = None
+
+            if parent_metrics:
+                # Use parent's calculated metrics — single source of truth
+                rr_val = parent_metrics.get('rr_interval')
+                pr_val = parent_metrics.get('pr_interval')
+                qrs_val = parent_metrics.get('qrs_duration')
+                p_val = parent_metrics.get('p_duration') or parent_metrics.get('st_interval')
+
+                if rr_val is not None:
+                    try:
+                        self.update_metric('rr_interval', int(float(str(rr_val).replace('--', '0'))))
+                    except (ValueError, TypeError):
+                        self.update_metric('rr_interval', 0)
+                if pr_val is not None:
+                    try:
+                        self.update_metric('pr_interval', int(float(str(pr_val).replace('--', '0'))))
+                    except (ValueError, TypeError):
+                        self.update_metric('pr_interval', 0)
+                if qrs_val is not None:
+                    try:
+                        self.update_metric('qrs_duration', int(float(str(qrs_val).replace('--', '0'))))
+                    except (ValueError, TypeError):
+                        self.update_metric('qrs_duration', 0)
+                if p_val is not None:
+                    try:
+                        self.update_metric('p_duration', int(float(str(p_val).replace('--', '0'))))
+                    except (ValueError, TypeError):
+                        self.update_metric('p_duration', 0)
+            else:
+                # Fallback: compute locally (same as before but with fixed min_distance)
+                filtered_signal = self._apply_display_bandpass(self.ecg_data, self.sampling_rate)
+                p_peaks, q_peaks, r_peaks, s_peaks, t_peaks = self.analyzer.find_pqrst(filtered_signal)
+
+                self.p_peaks = p_peaks
+                self.q_peaks = q_peaks
+                self.r_peaks = r_peaks
+                self.s_peaks = s_peaks
+                self.t_peaks = t_peaks
+
+                rr_intervals = np.diff(r_peaks) / self.sampling_rate * 1000
+                if len(rr_intervals) > 0:
+                    self.update_metric('rr_interval', int(np.median(rr_intervals)))
+                else:
+                    self.update_metric('rr_interval', 0)
+
+                pr_intervals = self.analyzer.calculate_pr_interval(p_peaks, r_peaks)
+                if len(pr_intervals) > 0:
+                    self.update_metric('pr_interval', int(np.median(pr_intervals)))
+                else:
+                    self.update_metric('pr_interval', 0)
+
+                qrs_durations = self.analyzer.calculate_qrs_duration(q_peaks, s_peaks)
+                if len(qrs_durations) > 0:
+                    self.update_metric('qrs_duration', int(np.median(qrs_durations)))
+                else:
+                    self.update_metric('qrs_duration', 0)
+
+                p_duration = self.calculate_p_duration(p_peaks, filtered_signal)
+                self.update_metric('p_duration', p_duration)
+
+            # Still run PQRST analysis for markers/arrhythmia display
+            # (even when using parent metrics for numbers)
             filtered_signal = self._apply_display_bandpass(self.ecg_data, self.sampling_rate)
-            
-            # Perform PQRST analysis
             p_peaks, q_peaks, r_peaks, s_peaks, t_peaks = self.analyzer.find_pqrst(filtered_signal)
-            
-            # Update markers for display
             self.p_peaks = p_peaks
             self.q_peaks = q_peaks
             self.r_peaks = r_peaks
             self.s_peaks = s_peaks
             self.t_peaks = t_peaks
 
-            # Calculate metrics
-            rr_intervals = np.diff(r_peaks) / self.sampling_rate * 1000 # in ms
-            if len(rr_intervals) > 0:
-                self.update_metric('rr_interval', int(np.median(rr_intervals)))
-            else:
-                self.update_metric('rr_interval', 0)
-
-            pr_intervals = self.analyzer.calculate_pr_interval(p_peaks, r_peaks)
-            if len(pr_intervals) > 0:
-                self.update_metric('pr_interval', int(np.median(pr_intervals)))
-            else:
-                self.update_metric('pr_interval', 0)
-
-            qrs_durations = self.analyzer.calculate_qrs_duration(q_peaks, s_peaks)
-            if len(qrs_durations) > 0:
-                self.update_metric('qrs_duration', int(np.median(qrs_durations)))
-            else:
-                self.update_metric('qrs_duration', 0)
-            
-            p_duration = self.calculate_p_duration(p_peaks, filtered_signal)
-            self.update_metric('p_duration', p_duration)
-
-            # Detect arrhythmias
+            rr_intervals = np.diff(r_peaks) / self.sampling_rate * 1000 if len(r_peaks) > 1 else np.array([])
             arrhythmias = self.arrhythmia_detector.detect_arrhythmias(r_peaks, rr_intervals)
             self.update_arrhythmia_display(arrhythmias)
 
@@ -2419,7 +2462,17 @@ class ExpandedLeadView(QDialog):
             if median_beat is not None and measure_pr_from_median_beat is not None:
                 try:
                     # Calculate PR using standardized function (same as 12-lead test page)
-                    pr_interval = measure_pr_from_median_beat(median_beat, time_axis, self.sampling_rate, tp_baseline)
+                    rr_ms = None
+                    try:
+                        if len(r_peaks) >= 2:
+                            rr_ms = float(np.median(np.diff(r_peaks) / self.sampling_rate * 1000.0))
+                    except Exception:
+                        rr_ms = None
+
+                    pr_interval = measure_pr_from_median_beat(
+                        median_beat, time_axis, self.sampling_rate, tp_baseline,
+                        rr_ms=rr_ms
+                    )
                     if pr_interval and pr_interval > 0:
                         self.update_metric('pr_interval', pr_interval)
                     else:

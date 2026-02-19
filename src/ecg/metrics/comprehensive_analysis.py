@@ -47,18 +47,25 @@ def calculate_comprehensive_metrics(lead_data: np.ndarray, fs: float = 500.0) ->
         return results
 
     sig -= np.mean(sig)
-    filt = bandpass(sig, fs)
+    # Use the same canonical R-peak detector (Pan–Tompkins) as the clinical path.
+    # This avoids conflicting RR/BPM values between "user metrics" and the main pipeline.
+    try:
+        from ..pan_tompkins import pan_tompkins
+        r_peaks = pan_tompkins(sig, fs=fs)
+    except Exception:
+        r_peaks = np.array([], dtype=int)
 
-    energy = np.diff(filt)**2
-    
-    # User logic: peaks,_ = find_peaks(energy,distance=int(0.3*FS),height=np.mean(energy)*5)
-    peaks, _ = find_peaks(energy, distance=int(0.3*fs), height=np.mean(energy)*5)
-    
-    if len(peaks) < 2:
-        return results
+    # Fallback to legacy energy-peaks if Pan–Tompkins fails
+    if len(r_peaks) < 2:
+        filt = bandpass(sig, fs)
+        energy = np.diff(filt) ** 2
+        peaks, _ = find_peaks(energy, distance=int(0.3 * fs), height=np.mean(energy) * 5)
+        if len(peaks) < 2:
+            return results
+        r_peaks = peaks
 
-    r = peaks[-1]
-    last_r_idx = peaks[-2] 
+    r = int(r_peaks[-1])
+    last_r_idx = int(r_peaks[-2])
     
     # Calculate RR and HR
     RR = (r - last_r_idx) / fs

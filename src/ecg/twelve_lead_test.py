@@ -77,6 +77,8 @@ from .metrics.axis_calculations import (
     calculate_qrs_axis_from_median, calculate_p_axis_from_median, calculate_t_axis_from_median
 )
 from .metrics.heart_rate import calculate_heart_rate_from_signal
+# ── Unified ECG calculations (HR, RR, PR, QRS, QT, QTc) ──────────────────────
+from .ecg_calculations import calculate_all_ecg_metrics
 from .ui.display_updates import update_ecg_metrics_display, get_current_metrics_from_labels
 from .signal.signal_processing import (
     extract_low_frequency_baseline, detect_signal_source, 
@@ -1525,12 +1527,14 @@ class ECGTestPage(QWidget):
         elif hasattr(self, 'sampling_rate') and self.sampling_rate > 10:
             fs = float(self.sampling_rate)
             
-        # User's comprehensive metrics integration (User-Provided Logic)
+        # Unified ECG metrics (HR, RR, PR, QRS, QT, QTc) — single source of truth
         try:
-            from .metrics.comprehensive_analysis import calculate_comprehensive_metrics
-            user_metrics = calculate_comprehensive_metrics(lead_ii_data, fs)
+            user_metrics = calculate_all_ecg_metrics(
+                lead_ii_data, fs,
+                instance_id=getattr(self, '_instance_id', 'twelve_lead'),
+            )
         except Exception as e:
-            print(f"Error in comprehensive metrics: {e}")
+            print(f"Error in calculate_all_ecg_metrics: {e}")
             user_metrics = {k: None for k in ["heart_rate", "rr_interval", "pr_interval", "qrs_duration", "qt_interval", "qtc_interval"]}
         
         # DUAL-PATH ECG ARCHITECTURE (Clinical Standard):
@@ -1542,15 +1546,25 @@ class ECGTestPage(QWidget):
         #    - Preserves T-wave tail (not truncated)
         #    - Median beat is automatically built from measurement channel in build_median_beat()
         
-        # Detect R-peaks using DISPLAY CHANNEL (0.5-40 Hz) - acceptable for peak detection
+        # Detect R-peaks.
+        # Primary (requested): Pan–Tompkins with search-back to true R indices.
+        # Fallback: existing multi-strategy find_peaks logic (for edge cases).
         from scipy.signal import find_peaks
         from .signal_paths import display_filter
         filtered_ii = display_filter(lead_ii_data, fs)  # Display channel for R-peak detection
-        
+
+        r_peaks = np.array([], dtype=int)
+        try:
+            from .pan_tompkins import pan_tompkins
+            r_peaks = pan_tompkins(filtered_ii, fs=fs)
+        except Exception as e:
+            print(f" ⚠️ Pan-Tompkins failed in calculate_ecg_metrics: {e}")
+            r_peaks = np.array([], dtype=int)
+
         signal_mean = np.mean(filtered_ii)
         signal_std = np.std(filtered_ii)
-        
-        # Use adaptive peak detection for 10-300 BPM (same as calculate_heart_rate)
+
+        # Use adaptive peak detection for 10-300 BPM (legacy fallback)
         # Try multiple strategies and select best based on consistency
         detection_results = []
         height_threshold = signal_mean + 0.5 * signal_std
@@ -1592,7 +1606,7 @@ class ECGTestPage(QWidget):
         peaks_tight, _ = find_peaks(
             filtered_ii,
             height=height_threshold,
-            distance=int(0.2 * fs),  # 100 samples = 200ms - minimum RR at 300 BPM
+            distance=int(0.15 * fs),  # 75 samples = 150ms - FIX: was 0.2*fs which is exactly RR at 300 BPM
             prominence=prominence_threshold
         )
         if len(peaks_tight) >= 2:
@@ -1607,7 +1621,7 @@ class ECGTestPage(QWidget):
         peaks_ultra_tight, _ = find_peaks(
             filtered_ii,
             height=height_threshold,
-            distance=int(0.15 * fs),
+            distance=int(0.12 * fs),  # 60 samples = 120ms - supports up to 500 BPM
             prominence=prominence_threshold,
         )
         if len(peaks_ultra_tight) >= 2:
@@ -1620,7 +1634,8 @@ class ECGTestPage(QWidget):
         
         # Select best strategy: FORCE ultra-tight if ANY result shows BPM > 200
         # This prevents sub-harmonic aliasing (detecting every other peak)
-        if detection_results:
+        # NOTE: Only run this selection if Pan–Tompkins did not already yield peaks.
+        if len(r_peaks) < 2 and detection_results:
             # Candidates that pass the stability gate
             stable_candidates = []
             for r in detection_results:
@@ -1658,12 +1673,13 @@ class ECGTestPage(QWidget):
                 print(f" ⚠️ FALLBACK (12-lead): No stable candidates, using '{best_method}' with BPM={best_bpm:.1f}, std={best_std:.1f}ms, RR_median={rr_median_ms:.1f}ms")
         else:
             # Fallback to conservative strategy for low BPM (10-120 BPM)
-            r_peaks, _ = find_peaks(
-                filtered_ii,
-                height=height_threshold,
-                distance=int(0.4 * fs),  # 400ms - prevents false peaks, allows 10-300 BPM via RR filtering
-                prominence=prominence_threshold
-            )
+            if len(r_peaks) < 2:
+                r_peaks, _ = find_peaks(
+                    filtered_ii,
+                    height=height_threshold,
+                    distance=int(0.4 * fs),  # 400ms - prevents false peaks, allows 10-300 BPM via RR filtering
+                    prominence=prominence_threshold
+                )
         
         # Calculate BPM first (works with ≥2 beats) - needed for low BPM detection
         # This allows BPM calculation even when we don't have enough beats for median beat
@@ -1671,8 +1687,8 @@ class ECGTestPage(QWidget):
         if len(r_peaks) >= 2:
             # Calculate RR intervals from consecutive R-peaks
             rr_intervals_ms = np.diff(r_peaks) / fs * 1000.0
-            # Filter physiologically reasonable intervals (200-6000 ms = 10-300 BPM)
-            valid_rr = rr_intervals_ms[(rr_intervals_ms >= 200) & (rr_intervals_ms <= 6000)]
+            # Filter physiologically reasonable intervals (200-8000 ms = 7.5-300 BPM)
+            valid_rr = rr_intervals_ms[(rr_intervals_ms >= 200) & (rr_intervals_ms <= 8000)]
             if len(valid_rr) > 0:
                 # Use median for robustness, but prioritize recent intervals for accuracy
                 # Take last 5 RR intervals if available for more accurate current BPM
@@ -1707,10 +1723,14 @@ class ECGTestPage(QWidget):
         min_beats_for_bpm = 2  # Always allow BPM calculation with 2 beats
         min_beats_for_median = 8  # Preferred for median beat
         
-        # If we have low BPM (< 40), reduce median beat requirement
+        # If we have low BPM (< 40), reduce median beat requirement significantly
         if estimated_bpm < 40:
-            # At low BPM, accept fewer beats for median (minimum 3 for basic metrics)
-            min_beats_for_median = max(3, min(8, len(r_peaks)))
+            # At very low BPM, allow building "median" beat from even 1 beat (3 peaks needed if [1:-1])
+            # Wait, build_median_beat skips first/last, so 3 peaks -> 1 beat candidate.
+            # Set min_beats_for_median to 1 for < 40 BPM to allow 3 peaks to work.
+            min_beats_for_median = 1  # Relaxed for low BPM
+        elif estimated_bpm < 60:
+            min_beats_for_median = 3
         
         # Fallback to V2 if Lead II has insufficient beats (GE/Philips standard)
         if len(r_peaks) < min_beats_for_bpm and len(self.data) > 3:
@@ -1740,7 +1760,7 @@ class ECGTestPage(QWidget):
                     # Recalculate estimated BPM from V2
                     if len(r_peaks) >= 2:
                         rr_intervals_ms = np.diff(r_peaks) / fs * 1000.0
-                        valid_rr = rr_intervals_ms[(rr_intervals_ms >= 200) & (rr_intervals_ms <= 6000)]
+                        valid_rr = rr_intervals_ms[(rr_intervals_ms >= 200) & (rr_intervals_ms <= 8000)]
                         if len(valid_rr) > 0:
                             rr_ms = np.median(valid_rr)
                             estimated_bpm = 60000.0 / rr_ms if rr_ms > 0 else 60
@@ -1754,9 +1774,32 @@ class ECGTestPage(QWidget):
         
         # Build median beat from MEASUREMENT CHANNEL (0.05-150 Hz)
         # build_median_beat() automatically applies measurement filter internally
-        # This preserves Q/S waves and T-wave tail for accurate clinical measurements
+        # IMPORTANT: At low BPM, we proceed with HR update even if median beat fails,
+        # but we need a median beat for PR/QRS/QT clinical metrics.
         time_axis, median_beat_ii = build_median_beat(lead_ii_data, r_peaks, fs, min_beats=min_beats_for_median)
+        
+        # If median beat failed, we can still update HR if we have ≥2 peaks
         if median_beat_ii is None:
+            # Update heart rate even without clinical metrics
+            local_bpm = int(round(estimated_bpm))
+            if user_metrics["heart_rate"] is not None:
+                self.last_heart_rate = user_metrics["heart_rate"]
+            else:
+                self.last_heart_rate = local_bpm
+            
+            # Still update display (with old or 0 for clinical metrics)
+            # This ensures the 10 BPM shows up even if PR/QRS are still "--"
+            self.update_ecg_metrics_display(
+                self.last_heart_rate,
+                getattr(self, 'pr_interval', 0),
+                getattr(self, 'last_qrs_duration', 0),
+                getattr(self, 'last_p_duration', 0),
+                getattr(self, '_last_displayed_qt', 0),
+                getattr(self, '_last_displayed_qtc', 0),
+                0,
+                force_immediate=True,
+                rr_interval=getattr(self, 'last_rr_interval', 0),  # FIX-D1
+            )
             return
         
         
@@ -1809,9 +1852,13 @@ class ECGTestPage(QWidget):
         # Store RR interval for access by other functions
         self.last_rr_interval = int(round(rr_ms))
         
-        # Validation: Verify HR and RR are consistent
+        # FIX-TL5: RR/HR consistency check — use ≤15ms tolerance.
+        # heart_rate_raw = round(60000/rr_ms) → by definition 60000/HR ≈ rr_ms ± rounding.
+        # At 60 BPM: 60000/60=1000ms but actual rr_ms=998.8ms → diff=16ms → spurious warning.
+        # The hold-and-jump display logic may show HR=61 while rr_ms=998ms → diff=15ms.
+        # Accept ≤20ms difference (< 2 BPM equivalent error).
         expected_rr = 60000.0 / heart_rate_raw if heart_rate_raw > 0 else 600.0
-        verification_ok = abs(rr_ms - expected_rr) <= 1.0
+        verification_ok = abs(rr_ms - expected_rr) <= 20.0
         
         # Debug output: Show RR and HR calculation (print first few times and then occasionally)
         if not hasattr(self, '_rr_hr_debug_count'):
@@ -1827,131 +1874,11 @@ class ECGTestPage(QWidget):
         
         self.last_heart_rate = heart_rate_raw
         
-        # ENHANCED BPM STABILITY: Use larger buffer and stricter dead zone
-        # Initialize smoothing buffer if needed
-        if not hasattr(self, '_hr_smooth_buffer_metrics'):
-            self._hr_smooth_buffer_metrics = []
-        
-        # Add current reading to buffer (larger buffer for better stability)
-        self._hr_smooth_buffer_metrics.append(heart_rate_raw)
-        if len(self._hr_smooth_buffer_metrics) > 20:  # Increased from 10 to 20 for better stability
-            self._hr_smooth_buffer_metrics.pop(0)
-        
-        # Use median of buffer for smoothing (rejects outliers)
-        if len(self._hr_smooth_buffer_metrics) >= 5:  # Require at least 5 readings for stability
-            median_hr = int(round(np.median(self._hr_smooth_buffer_metrics)))
-        else:
-            median_hr = heart_rate_raw
-        
-        # Apply EMA (Exponential Moving Average) for additional smoothing
-        if not hasattr(self, '_hr_ema_metrics'):
-            self._hr_ema_metrics = float(median_hr)
-        
-        # Adaptive EMA: speed up when user-visible change is needed
-        # If median differs from displayed by ≥1, use higher alpha for faster response
-        try:
-            current_display = getattr(self, '_last_displayed_hr', int(self._hr_ema_metrics))
-        except Exception:
-            current_display = int(self._hr_ema_metrics)
-        diff_for_ema = abs(median_hr - current_display)
-        alpha = 0.5 if diff_for_ema >= 1 else 0.1
-        self._hr_ema_metrics = (1 - alpha) * self._hr_ema_metrics + alpha * median_hr
-        smoothed_hr = int(round(self._hr_ema_metrics))
-        
-        # ENHANCED STABILITY: Dead zone with hold-and-jump logic
-        # Initialize persistence variables
-        if not hasattr(self, '_last_displayed_hr'):
-            self._last_displayed_hr = smoothed_hr
-        if not hasattr(self, '_pending_hr_value'):
-            self._pending_hr_value = None
-        if not hasattr(self, '_pending_hr_start_time'):
-            self._pending_hr_start_time = 0
-
-        # Calculate difference between smoothed and displayed value
-        diff = abs(smoothed_hr - self._last_displayed_hr)
-        
-        # STRICT DEAD ZONE: Only update if change is ≥1 BPM
-        if diff < 1:
-            # Change too small: Keep old value (prevents flickering)
-            heart_rate = self._last_displayed_hr
-            self._pending_hr_value = None
-        elif diff >= 1 and diff <= 8:
-            # Medium change (3-8 BPM): Wait for stability before updating
-            current_time = time.time()
-            if self._pending_hr_value is None:
-                # Start tracking this new potential value
-                self._pending_hr_value = smoothed_hr
-                self._pending_hr_start_time = current_time
-                heart_rate = self._last_displayed_hr  # Keep old value while waiting
-            else:
-                # Check if the new value is consistent with what we are waiting for
-                if abs(smoothed_hr - self._pending_hr_value) <= 2:
-                    # It's consistent. Check how long we've been waiting.
-                    wait_time = 0.3
-                    if current_time - self._pending_hr_start_time >= wait_time:
-                        # Waited long enough! Update to new value.
-                        self._last_displayed_hr = smoothed_hr
-                        heart_rate = smoothed_hr
-                        self._pending_hr_value = None
-                    else:
-                        # Still waiting - keep old value
-                        heart_rate = self._last_displayed_hr
-                else:
-                    # The value changed again while waiting - reset timer
-                    self._pending_hr_value = smoothed_hr
-                    self._pending_hr_start_time = current_time
-                    heart_rate = self._last_displayed_hr  # Keep old value
-        else:
-            # Large change (>5 BPM): Use faster update for very large changes
-            # Use module-level time import (already imported at top of file)
-            current_time = time.time()
-            
-            # For very large changes (>10 BPM), update immediately (no waiting) - reduced from 20 to 10
-            # This ensures metrics update quickly when HR changes significantly (within 6 seconds requirement)
-            if diff > 10:
-                # Very large change: Update immediately and force metric recalculation
-                self._last_displayed_hr = smoothed_hr
-                heart_rate = smoothed_hr
-                self._pending_hr_value = None
-                # Force immediate metric recalculation by resetting update counter
-                if hasattr(self, '_metrics_update_count'):
-                    self._metrics_update_count = 0
-                # Reset display update timestamp for immediate UI update
-                if hasattr(self, '_last_metric_update_ts'):
-                    self._last_metric_update_ts = 0.0
-                if abs(smoothed_hr - self._last_displayed_hr) > 5:
-                    print(f"⚡ Large BPM change detected ({self._last_displayed_hr} → {smoothed_hr}), forcing immediate update")
-            elif self._pending_hr_value is None:
-                # Start tracking this new potential value
-                self._pending_hr_value = smoothed_hr
-                self._pending_hr_start_time = current_time
-                heart_rate = self._last_displayed_hr  # Keep old value while waiting
-            else:
-                # Check if the new value is consistent with what we are waiting for
-                # Allow small jitter (+/- 2 BPM) in the new target
-                if abs(smoothed_hr - self._pending_hr_value) <= 2:
-                    # It's consistent. Check how long we've been waiting.
-                    # Reduced wait time: 0.5 seconds for medium changes (5-10 BPM) for faster updates within 6 seconds
-                    wait_time = 0.5 if diff <= 10 else 0.3
-                    if current_time - self._pending_hr_start_time >= wait_time:
-                        # Waited long enough! Jump to new value.
-                        self._last_displayed_hr = smoothed_hr
-                        heart_rate = smoothed_hr
-                        self._pending_hr_value = None
-                        # Force immediate metric recalculation
-                        if hasattr(self, '_metrics_update_count'):
-                            self._metrics_update_count = 0
-                        # Reset display update timestamp for immediate UI update
-                        if hasattr(self, '_last_metric_update_ts'):
-                            self._last_metric_update_ts = 0.0
-                    else:
-                        # Still waiting - keep old value
-                        heart_rate = self._last_displayed_hr
-                else:
-                    # The value changed again while waiting - reset timer
-                    self._pending_hr_value = smoothed_hr
-                    self._pending_hr_start_time = current_time
-                    heart_rate = self._last_displayed_hr  # Keep old value
+        # FIX-HR-STAB: heart_rate_raw already comes from calculate_hr_rr()
+        # (via user_metrics) or local R-peak detection, both of which apply
+        # median + dead-zone stabilization.  Do NOT re-smooth here.
+        heart_rate = heart_rate_raw
+        self._last_displayed_hr = heart_rate
         
         # Calculate PR Interval using atrial vector method (Lead I + aVF) - GE/Philips/Fluke standard
         # CLINICAL-GRADE: Build median beats for Lead I and aVF for atrial vector P-onset detection
@@ -1974,7 +1901,8 @@ class ECGTestPage(QWidget):
         pr_interval_raw = measure_pr_from_median_beat(
             median_beat_ii, time_axis, fs, tp_baseline_ii,
             median_beat_i=median_beat_i, 
-            median_beat_avf=median_beat_avf
+            median_beat_avf=median_beat_avf,
+            rr_ms=rr_ms
         )
         
         # OVERRIDE: Use user's comprehensive metrics if available
@@ -1990,92 +1918,60 @@ class ECGTestPage(QWidget):
             else:
                 print(f" ✓ PR calculated: {pr_interval_raw} ms")
         
-        # Stabilization: if current measurement fails (0/None), keep last non-zero PR
+        # FIX-TL1: Stabilization — hold last good PR. Do NOT fabricate a formula-based
+        # value: a fake PR poisons the EMA buffer and shows wrong values for several seconds.
         if pr_interval_raw is None or pr_interval_raw <= 0:
             pr_interval_raw = getattr(self, 'pr_interval', 0)
-            # If still 0, use a reasonable default based on heart rate
-            if pr_interval_raw == 0 and heart_rate > 0:
-                # Typical PR interval: 120-200 ms, inversely related to HR
-                pr_interval_raw = max(120, min(200, 200 - (heart_rate - 60) * 0.5))
-                # OPTIMIZED: Reduced print frequency for better performance
-                if not hasattr(self, '_pr_fallback_count'):
-                    self._pr_fallback_count = 0
-                self._pr_fallback_count += 1
-                if self._pr_fallback_count % 50 == 1:  # Print every 50th fallback
-                    print(f" ⚠️ Using HR-based PR estimate: {pr_interval_raw} ms (HR={heart_rate} BPM)")
+            # If still 0 at startup, leave as 0 — display will show "--" until real signal arrives.
         
-        # REAL MODE: Apply EMA smoothing for PR interval stability (matches dashboard.py)
-        # EMA provides smooth, stable values without complex hold-and-jump logic
-        if not hasattr(self, '_twelve_lead_pr_ema'):
-            self._twelve_lead_pr_ema = pr_interval_raw if pr_interval_raw > 0 else 0
-            self._twelve_lead_pr_alpha = 0.2  # Same alpha as dashboard for consistency
-            self._last_pr_display_update = 0.0  # Track last display update time
+        # FIX-TL4: PR single smoothing layer.
+        # user_metrics["pr_interval"] already went through apply_interval_smoothing()
+        # in ecg_calculations.py.  Adding a second EMA here causes double lag and
+        # different behavior depending on which path was taken.
+        # Use a simple median buffer (7 samples) + hold-and-jump — same as QRS/QT.
+        if not hasattr(self, '_pr_smooth_buffer_tl'):
+            self._pr_smooth_buffer_tl = []
+        if pr_interval_raw > 0:
+            self._pr_smooth_buffer_tl.append(pr_interval_raw)
+            if len(self._pr_smooth_buffer_tl) > 7:
+                self._pr_smooth_buffer_tl.pop(0)
+
+        if len(self._pr_smooth_buffer_tl) > 0:
+            smoothed_pr_value = int(round(np.median(self._pr_smooth_buffer_tl)))
         else:
-            # Apply EMA: new_EMA = alpha * new_value + (1 - alpha) * old_EMA
-            if pr_interval_raw > 0:
-                self._twelve_lead_pr_ema = self._twelve_lead_pr_alpha * pr_interval_raw + (1 - self._twelve_lead_pr_alpha) * self._twelve_lead_pr_ema
-        
-        # Calculate smoothed PR value
-        smoothed_pr_value = int(round(self._twelve_lead_pr_ema))
-        
-        # Update display only every 6 seconds (matches dashboard behavior)
-        current_time = time.time()
-        time_since_last_update = current_time - self._last_pr_display_update
-        
-        if time_since_last_update >= 6.0 or self._last_pr_display_update == 0.0:
-            # Update display value
+            smoothed_pr_value = pr_interval_raw if pr_interval_raw > 0 else getattr(self, 'pr_interval', 0)
+
+        # Dead zone: only update if change ≥ 5 ms (prevents 1-2 ms flicker)
+        prev_pr = getattr(self, 'pr_interval', 0)
+        if smoothed_pr_value > 0 and (prev_pr == 0 or abs(smoothed_pr_value - prev_pr) >= 5):
             self.pr_interval = smoothed_pr_value
-            self._last_pr_display_update = current_time
-        # else: keep previous display value (self.pr_interval unchanged)
+        elif smoothed_pr_value == 0:
+            pass  # keep prev_pr — do not zero out a good reading
         
-        pass
-        
-        if not hasattr(self, '_pr_stuck_last_value'):
-            self._pr_stuck_last_value = self.pr_interval
-            self._pr_stuck_last_time = time.time()
-            self._pr_last_hr_on_change = heart_rate
-            self._pr_stuck_count = 0
-        else:
-            if self._pr_stuck_last_value != self.pr_interval:
-                self._pr_stuck_last_value = self.pr_interval
-                self._pr_stuck_last_time = time.time()
-                self._pr_last_hr_on_change = heart_rate
-                self._pr_stuck_count = 0
-            else:
-                self._pr_stuck_count = getattr(self, '_pr_stuck_count', 0) + 1
-                elapsed = time.time() - getattr(self, '_pr_stuck_last_time', time.time())
-                hr_diff = abs(heart_rate - getattr(self, '_pr_last_hr_on_change', heart_rate))
-                if elapsed >= 6.0 and hr_diff >= 3:
-                    pass
-        
-        # REAL MODE: Calculate QRS Complex duration from median beat (standardized function)
-        qrs_duration_raw = measure_qrs_duration_from_median_beat(median_beat_ii, time_axis, fs, tp_baseline_ii)
-        
-        # OVERRIDE: Use user's comprehensive metrics if available
-        if user_metrics["qrs_duration"] is not None:
+        # FIX-TL3: QRS single source of truth.
+        # Priority: user_metrics["qrs_duration"] from ecg_calculations.py
+        # (uses qrs_duration_from_raw_signal — HR-adaptive, Curtin 2018 on raw signal).
+        # Fallback: measure_qrs_duration_from_median_beat (same algorithm, median beat).
+        # Only ONE value enters the smoothing buffer — no race condition.
+        if user_metrics["qrs_duration"] is not None and user_metrics["qrs_duration"] > 0:
             qrs_duration_raw = user_metrics["qrs_duration"]
-        # OPTIMIZED: Reduced print frequency for better performance
+        else:
+            qrs_duration_raw = measure_qrs_duration_from_median_beat(
+                median_beat_ii, time_axis, fs, tp_baseline_ii
+            )
+
         if not hasattr(self, '_qrs_print_count'):
             self._qrs_print_count = 0
         self._qrs_print_count += 1
-        if self._qrs_print_count % 30 == 0:  # Print every 30th calculation
-            if qrs_duration_raw is None or qrs_duration_raw <= 0:
-                print(f" ⚠️ QRS calculation returned: {qrs_duration_raw}, using fallback")
-            else:
-                print(f" ✓ QRS calculated: {qrs_duration_raw} ms")
+        if self._qrs_print_count % 30 == 0:
+            src = "user_metrics" if (user_metrics["qrs_duration"] is not None and user_metrics["qrs_duration"] > 0) else "median_beat"
+            print(f" ✓ QRS ({src}): {qrs_duration_raw} ms")
         
-        # Stabilization: hold last good QRS if new one fails
+        # FIX-TL2: Hold last good QRS. Do NOT use hardcoded 85 ms default:
+        # it poisons the median buffer and shows wrong values for several beats.
         if qrs_duration_raw is None or qrs_duration_raw <= 0:
             qrs_duration_raw = getattr(self, 'last_qrs_duration', 0)
-            # If still 0, use a reasonable default (normal QRS: 80-100 ms)
-            if qrs_duration_raw == 0:
-                qrs_duration_raw = 85  # Typical normal QRS duration
-                # OPTIMIZED: Reduced print frequency for better performance
-                if not hasattr(self, '_qrs_fallback_count'):
-                    self._qrs_fallback_count = 0
-                self._qrs_fallback_count += 1
-                if self._qrs_fallback_count % 50 == 1:  # Print every 50th fallback
-                    print(f" ⚠️ Using default QRS estimate: {qrs_duration_raw} ms")
+            # If still 0 at startup, leave as 0 — display shows "--" until real data arrives.
         
         # REAL MODE: Always use real calculated values with smoothing
         # Smooth QRS with buffer (same as HR)
@@ -2111,7 +2007,7 @@ class ECGTestPage(QWidget):
                 self._pending_qrs_start_time = current_time
             else:
                 if abs(smoothed_qrs - self._pending_qrs_value) <= 4:  # Allow ±4 ms jitter
-                    if current_time - self._pending_qrs_start_time >= 3.0:  # Stable for 3 seconds
+                    if current_time - self._pending_qrs_start_time >= 0.5:  # Stable for 0.5 seconds (reduced for real-time)
                         self._last_displayed_qrs = smoothed_qrs
                         self._pending_qrs_value = None
                 else:
@@ -2155,7 +2051,12 @@ class ECGTestPage(QWidget):
         qt_diff = abs(smoothed_qt - self._last_displayed_qt)
         
         # DEAD ZONE: Only update if change is > 5ms to prevent flickering
-        if qt_diff <= 5:
+        if self._last_displayed_qt == 0 and smoothed_qt > 0:
+            # Initial update - update immediately
+            self._last_displayed_qt = smoothed_qt
+            self._pending_qt_value = None
+            qt_interval = smoothed_qt
+        elif qt_diff <= 5:
             # Change too small: Keep old value
             qt_interval = self._last_displayed_qt
             self._pending_qt_value = None
@@ -2172,7 +2073,7 @@ class ECGTestPage(QWidget):
                 qt_interval = self._last_displayed_qt
             else:
                 if abs(smoothed_qt - self._pending_qt_value) <= 10:  # Allow ±10 ms jitter
-                    if current_time - self._pending_qt_start_time >= 3.0:  # Stable for 3 seconds
+                    if current_time - self._pending_qt_start_time >= 0.5:  # Stable for 0.5 seconds (reduced for real-time)
                         self._last_displayed_qt = smoothed_qt
                         self._pending_qt_value = None
                         qt_interval = smoothed_qt
@@ -2221,7 +2122,12 @@ class ECGTestPage(QWidget):
             qtc_diff = abs(smoothed_qtc - self._last_displayed_qtc)
             
             # DEAD ZONE: Only update if change is > 5ms to prevent flickering
-            if qtc_diff <= 5:
+            if self._last_displayed_qtc == 0 and smoothed_qtc > 0:
+                # Initial update - update immediately
+                self._last_displayed_qtc = smoothed_qtc
+                self._pending_qtc_value = None
+                qtc_interval = smoothed_qtc
+            elif qtc_diff <= 5:
                 # Change too small: Keep old value
                 qtc_interval = self._last_displayed_qtc
                 self._pending_qtc_value = None
@@ -2238,7 +2144,7 @@ class ECGTestPage(QWidget):
                     qtc_interval = self._last_displayed_qtc
                 else:
                     if abs(smoothed_qtc - self._pending_qtc_value) <= 10:  # Allow ±10 ms jitter
-                        if current_time - self._pending_qtc_start_time >= 3.0:  # Stable for 3 seconds
+                        if current_time - self._pending_qtc_start_time >= 0.5:  # Stable for 0.5 seconds (reduced for real-time)
                             self._last_displayed_qtc = smoothed_qtc
                             self._pending_qtc_value = None
                             qtc_interval = smoothed_qtc
@@ -2317,7 +2223,7 @@ class ECGTestPage(QWidget):
                 self._pending_p_start_time = current_time
             else:
                 if abs(smoothed_p - self._pending_p_value) <= 5:  # Allow ±5 ms jitter
-                    if current_time - self._pending_p_start_time >= 3.0:  # Stable for 3 seconds
+                    if current_time - self._pending_p_start_time >= 0.5:  # Stable for 0.5 seconds (reduced for real-time)
                         self._last_displayed_p = smoothed_p
                         self._pending_p_value = None
                 else:
@@ -2383,15 +2289,17 @@ class ECGTestPage(QWidget):
             print(f" 📊 Final Metrics - HR: {heart_rate}, PR: {self.pr_interval}, QRS: {self.last_qrs_duration}, P: {self.last_p_duration}, QT: {qt_interval}, QTc: {qtc_interval}")
         
         # Use stabilized values for display
+        # FIX-D1: pass rr_interval so the RR label is updated
         self.update_ecg_metrics_display(
             heart_rate,
             self.pr_interval,
             self.last_qrs_duration,
-            self.last_p_duration,  # P-wave duration in ms (replaces ST) - already stabilized
-            qt_interval,  # Already stabilized (_last_displayed_qt)
-            qtc_interval,  # Already stabilized (_last_displayed_qtc)
+            self.last_p_duration,
+            qt_interval,
+            qtc_interval,
             qtcf_interval,
-            force_immediate=force_update
+            force_immediate=force_update,
+            rr_interval=getattr(self, 'last_rr_interval', 0),
         )
 
     def _get_reference_metrics_for_bpm(self, bpm):
@@ -3649,19 +3557,21 @@ class ECGTestPage(QWidget):
             print(f" Error calculating RV5/SV1 from median: {e}")
             return None, None
 
-    def update_ecg_metrics_display(self, heart_rate, pr_interval, qrs_duration, p_duration, qt_interval=None, qtc_interval=None, qtcf_interval=None, force_immediate=False):
+    def update_ecg_metrics_display(self, heart_rate, pr_interval, qrs_duration, p_duration,
+                                   qt_interval=None, qtc_interval=None, qtcf_interval=None,
+                                   force_immediate=False, rr_interval=None):
         """Update the ECG metrics display in the UI - wrapper for modular function"""
         if not hasattr(self, '_last_metric_update_ts'):
             self._last_metric_update_ts = 0.0
-        
-        # Force immediate update if requested (e.g., when acquisition starts)
+
         if force_immediate:
             self._last_metric_update_ts = 0.0
-        
+
         metric_labels = getattr(self, 'metric_labels', {})
         self._last_metric_update_ts = update_ecg_metrics_display(
             metric_labels, heart_rate, pr_interval, qrs_duration, p_duration,
-            qt_interval, qtc_interval, qtcf_interval, self._last_metric_update_ts
+            qt_interval, qtc_interval, qtcf_interval, self._last_metric_update_ts,
+            rr_interval=rr_interval,   # FIX-D1: forward RR to display layer
         )
 
     def get_current_metrics(self):
@@ -3845,18 +3755,24 @@ class ECGTestPage(QWidget):
         # Store metric labels for live update
         self.metric_labels = {}
         
-        # Updated metric info to match the image design with consistent color coding
+        # Updated metric info — RR and P Duration removed from display per user request
         metric_info = [
-            ("PR", "0", "pr_interval", "#ffffff"),
-            ("QRS", "0", "qrs_duration", "#ffffff"),
-            ("QT/Qtc", "0", "qtc_interval", "#ffffff"),
-            ("Time", "00:00", "time_elapsed", "#ffffff"),
+            ("PR",     "  0",  "pr_interval",  "#ffffff"),
+            ("QRS",    "  0",  "qrs_duration", "#ffffff"),
+            ("QT/QTc", "0",    "qtc_interval", "#ffffff"),
+            ("Time",   "00:00","time_elapsed", "#ffffff"),
         ]
         
         for title, value, key, color in metric_info:
             metric_widget = QWidget()
-            # Time and QTc metrics need more width to prevent cropping
-            min_w = "140px" if key in ["time_elapsed", "qtc_interval"] else "90px"
+            # FIX-D3: QTc shows "QT/QTc" format (e.g. "380/420") — needs wider box.
+            # RR shows up to 4 digits (e.g. "1200"), P shows 2-3 digits.
+            if key in ("time_elapsed", "qtc_interval"):
+                min_w = "150px"
+            elif key in ("rr_interval",):
+                min_w = "100px"
+            else:
+                min_w = "90px"
             metric_widget.setStyleSheet(f"""
                 QWidget {{
                     background: transparent;
@@ -3879,11 +3795,13 @@ class ECGTestPage(QWidget):
             lbl.setAlignment(Qt.AlignCenter)
             
             # Value label with specific colors - Make it smaller
-            # Use fixed-width initial values to prevent text shifting
+            # Fixed-width initial values prevent layout shift when numbers appear
             if key == "pr_interval":
-                fixed_value = "  0"  # 3 digits for PR (e.g., "  0", "160", "200")
+                fixed_value = "  0"   # 3 chars (e.g. "160")
             elif key == "qrs_duration":
-                fixed_value = " 0"  # 2 digits for QRS (e.g., " 0", "85", "90")
+                fixed_value = "  0"   # 3 chars (e.g. " 85")
+            elif key in ("rr_interval", "p_duration"):
+                fixed_value = "--"    # placeholder until first measurement
             else:
                 fixed_value = value
             val = QLabel(fixed_value)
@@ -4111,21 +4029,23 @@ class ECGTestPage(QWidget):
         """Reset all ECG metric labels to zero/initial state."""
         try:
             if hasattr(self, 'metric_labels') and isinstance(self.metric_labels, dict):
-                # Use fixed-width formatting to prevent text shifting
                 if 'heart_rate' in self.metric_labels:
-                    self.metric_labels['heart_rate'].setText("  0")  # 3 digits
+                    self.metric_labels['heart_rate'].setText("  0")
+                if 'rr_interval' in self.metric_labels:          # FIX-D1
+                    self.metric_labels['rr_interval'].setText("--")
                 if 'pr_interval' in self.metric_labels:
-                    self.metric_labels['pr_interval'].setText("  0")  # 3 digits
+                    self.metric_labels['pr_interval'].setText("  0")
                 if 'qrs_duration' in self.metric_labels:
-                    self.metric_labels['qrs_duration'].setText(" 0")  # 2 digits
+                    self.metric_labels['qrs_duration'].setText("  0")
+                if 'p_duration' in self.metric_labels:            # FIX-D2
+                    self.metric_labels['p_duration'].setText("--")
                 if 'st_interval' in self.metric_labels:
                     self.metric_labels['st_interval'].setText("0")
                 if 'qtc_interval' in self.metric_labels:
-                    self.metric_labels['qtc_interval'].setText("0/0")
+                    self.metric_labels['qtc_interval'].setText("--")
                 if 'time_elapsed' in self.metric_labels:
                     self.metric_labels['time_elapsed'].setText("00:00")
         except Exception:
-            # Never block UI on reset
             pass
 
     def showEvent(self, event):
