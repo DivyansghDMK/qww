@@ -353,6 +353,9 @@ def measure_qt_from_median_beat(median_beat, time_axis, fs, tp_baseline, rr_ms=N
 
         Q_onset = max(0, qrs_start - int(0.04 * fs))
 
+        # Define t_start (missing previously) - Start search 40ms after QRS end
+        t_start = qrs_end + int(0.04 * fs)
+
         # FIX #10: Clamp search window to min(500ms, 0.9 * RR) to prevent overlap
         # Validated against high BPM cases (260 BPM -> RR=230ms -> clamp ~207ms)
         search_window_ms = min(500, 0.9 * rr_ms)
@@ -401,29 +404,26 @@ def measure_qt_from_median_beat(median_beat, time_axis, fs, tp_baseline, rr_ms=N
         t_end   = int(np.clip(t_end, min_end, max_end))
 
         QT = (t_end - Q_onset) / fs * 1000
-        
-        # Physiological Check (discard impossible QT > RR*0.44 + X or simple QT > RR)
-        # Using a loose check: QT must be < RR (physically impossible otherwise)
-        if QT > rr_ms:
-             return None
-             
-        # Strict physiological clamp for buffering valid values
-        # Max QT = 0.44 * RR + constant? No, simple RR check is safest for exclusion.
-        # User requested: max_qt = RR*0.44 + 50
-        max_phys_qt = rr_ms * 0.44 + 80 # relaxed to +80 for safety
-        # Actually user said +50. Let's stick to user request.
-        max_phys_qt_strict = rr_ms * 0.44 + 50
-        
-        # Return None if grossly invalid
-        if QT > max(max_phys_qt_strict, rr_ms * 0.6): # Allow up to 60% RR or formula
-             # But at high rate (260 bpm => 230ms), 60% is 138ms. 
-             # QTc logic might fail.
-             # Lets just return QT and let upper layer filter?
-             # User said "before buffering". Since this is a measurement function...
-             # If I return None, it won't be buffered.
-             if QT > rr_ms * 0.95: # Safety hard limit
-                 return None
-                 
+
+        # ── Physiological QT validity gate (FIX-CM1) ─────────────────────────
+        # Single, consistent gate replaces the previous contradictory multi-check.
+        #
+        # Lower bound: minimum physiologically possible QT
+        #   Normal: 200 ms  |  HR > 150: 170 ms  |  HR > 200: 150 ms
+        # Upper bound:
+        #   QT cannot exceed 0.85 * RR (Bazett's physiological ceiling).
+        #   At very high HR (>200 BPM, RR ≈ 200-300 ms) we allow up to 90% RR
+        #   because the T-wave genuinely sits close to the next P.
+        #   Absolute hard cap: QT < RR (physically impossible otherwise).
+        estimated_hr_local = 60000.0 / rr_ms if rr_ms > 0 else 75.0
+
+        qt_min = 150.0 if estimated_hr_local > 200 else (170.0 if estimated_hr_local > 150 else 200.0)
+        qt_max_pct = 0.90 if estimated_hr_local > 200 else (0.88 if estimated_hr_local > 150 else 0.85)
+        qt_max = min(rr_ms * qt_max_pct, rr_ms - 10.0)  # always < RR
+
+        if not (qt_min <= QT <= qt_max):
+            return None
+
         return QT
 
     except Exception as e:
@@ -616,6 +616,24 @@ def detect_p_wave_bounds(median_beat, r_idx, fs, tp_baseline, rr_ms=None):
         if np.abs(segment_corrected[peak_idx_rel]) < threshold:
             return None, None
 
+        # FIX-CM2: Cap P-offset search window.
+        # Previously offset_idx could extend all the way to (r_idx - 50ms),
+        # causing P duration to include the entire PR segment → P=199ms instead of ~92ms.
+        # True P wave max half-duration: ~55ms at 60 BPM, ~45ms at 150+ BPM.
+        # We cap the forward search to peak_idx + max_half_p_dur_samples.
+        # Also must stop at least 20ms before QRS onset (r_idx - 50ms search_end).
+        if estimated_hr > 150:
+            max_half_p_dur_ms = 40.0
+        elif estimated_hr > 100:
+            max_half_p_dur_ms = 45.0
+        elif estimated_hr > 60:
+            max_half_p_dur_ms = 50.0
+        else:
+            max_half_p_dur_ms = 55.0
+        max_half_p_dur_samples = int(max_half_p_dur_ms / 1000.0 * fs)
+        # offset search cannot go past: peak + max_half_p_dur, and must stay < search_end
+        offset_search_end = min(search_end, peak_idx + max_half_p_dur_samples)
+
         # FIX #9: use corrected[] instead of (median_beat[i] - tp_baseline)
         onset_idx = search_start
         for i in range(peak_idx, search_start, -1):
@@ -623,8 +641,9 @@ def detect_p_wave_bounds(median_beat, r_idx, fs, tp_baseline, rr_ms=None):
                 onset_idx = i
                 break
 
-        offset_idx = search_end
-        for i in range(peak_idx, search_end):
+        # FIX-CM2: search forward only within capped window
+        offset_idx = offset_search_end  # default = cap if signal never drops
+        for i in range(peak_idx, offset_search_end):
             if np.abs(corrected[i]) < threshold * 0.3:
                 offset_idx = i
                 break
@@ -659,7 +678,16 @@ def measure_p_duration_from_median_beat(median_beat, time_axis, fs, tp_baseline,
 
         p_duration_ms = time_axis[p_offset_idx] - time_axis[p_onset_idx]
 
-        if 40 <= p_duration_ms <= 200:
+        # FIX-CM2: Tightened physiological gate.
+        # Previously max=200ms allowed PR-contaminated values (199ms) through.
+        # True P-wave: 40-120ms. Values > 120ms mean offset crept into PR segment.
+        # HR-adaptive max: 60ms at >150 BPM (very short P), 120ms at ≤60 BPM.
+        r_idx_local = np.argmin(np.abs(time_axis))
+        rr_ms_local = rr_ms if rr_ms and rr_ms > 0 else len(time_axis) / fs * 1000.0
+        est_hr_local = 60000.0 / rr_ms_local if rr_ms_local > 0 else 75.0
+        p_max_ms = 60.0 if est_hr_local > 150 else (80.0 if est_hr_local > 100 else 120.0)
+
+        if 30 <= p_duration_ms <= p_max_ms:
             return int(round(p_duration_ms))
         return 0
 
@@ -745,7 +773,8 @@ def detect_p_onset_atrial_vector(median_beat_i, median_beat_avf, median_beat_ii,
 
 
 def measure_pr_from_median_beat(median_beat_ii, time_axis, fs, tp_baseline_ii,
-                                 median_beat_i=None, median_beat_avf=None):
+                                 median_beat_i=None, median_beat_avf=None,
+                                 rr_ms: float = None):
     """
     Measure PR interval using atrial vector method (GE/Philips/Fluke standard).
 
@@ -764,18 +793,21 @@ def measure_pr_from_median_beat(median_beat_ii, time_axis, fs, tp_baseline_ii,
         tp_baseline_ii:  TP baseline from Lead II.
         median_beat_i:   Median beat from Lead I (atrial vector, optional).
         median_beat_avf: Median beat from Lead aVF (atrial vector, optional).
+        rr_ms:           RR interval in ms (optional, for HR-aware PR windows).
 
     Returns:
         PR interval in ms, or 0 if not measurable.
     """
     try:
-        sig = np.array(median_beat_ii, dtype=float)
+        sig_raw = np.array(median_beat_ii, dtype=float)
 
         # FIX #6: Median beat is ~651 samples – changed from 2000 → 100
-        if len(sig) < 100:
+        if len(sig_raw) < 100:
             return 0
 
-        sig -= np.mean(sig)
+        # Baseline-correct using TP baseline (clinical), then center
+        sig_corrected = sig_raw - (tp_baseline_ii if tp_baseline_ii is not None else 0.0)
+        sig = sig_corrected - np.mean(sig_corrected)
 
         nyq  = fs / 2.0
         low  = max(0.5 / nyq, 0.001)
@@ -816,25 +848,152 @@ def measure_pr_from_median_beat(median_beat_ii, time_axis, fs, tp_baseline_ii,
 
         Q_onset = max(0, qrs_start - int(0.04 * fs))
 
-        median_beat_length_ms = len(sig) / fs * 1000.0
-        estimated_hr = 60000.0 / median_beat_length_ms if median_beat_length_ms > 0 else 100.0
+        # ------------------------------------------------------------------
+        # HR-aware PR windowing (ported from user's Android logic)
+        # Supports ~30–250 BPM by scaling PR search windows and capping by RR.
+        # ------------------------------------------------------------------
+        try:
+            rr_ms_local = float(rr_ms) if rr_ms is not None and rr_ms > 0 else None
+        except Exception:
+            rr_ms_local = None
 
-        if estimated_hr >= 140.0:
-            pl = max(0, Q_onset - int(0.18 * fs))
-            pr = Q_onset - int(0.05 * fs)
-        elif estimated_hr >= 100.0:
-            pl = max(0, Q_onset - int(0.20 * fs))
-            pr = Q_onset - int(0.06 * fs)
-        else:
-            pl = max(0, Q_onset - int(0.20 * fs))
-            pr = Q_onset - int(0.06 * fs)
+        estimated_hr = (60000.0 / rr_ms_local) if rr_ms_local else 75.0
 
-        if pr <= pl or pr > len(sig):
+        # Min PR interval: allow very short PR at extreme tachycardia
+        pr_min_ms = (
+            50 if estimated_hr > 200 else
+            60 if estimated_hr > 150 else
+            70 if estimated_hr > 120 else
+            80
+        )
+
+        # Max PR interval baseline (ms)
+        base_max_pr = (
+            250 if estimated_hr < 60 else
+            200 if estimated_hr <= 100 else
+            170 if estimated_hr <= 120 else
+            145 if estimated_hr <= 140 else
+            125 if estimated_hr <= 160 else
+            110 if estimated_hr <= 180 else
+            95  if estimated_hr <= 200 else
+            80  if estimated_hr <= 220 else
+            72  if estimated_hr <= 240 else
+            68  if estimated_hr <= 260 else
+            65
+        )
+
+        # RR cap percentage (prevents PR window from overlapping previous T at high HR)
+        rr_cap_pct = (
+            0.70 if estimated_hr <= 120 else
+            0.55 if estimated_hr <= 140 else
+            0.45 if estimated_hr <= 160 else
+            0.40 if estimated_hr <= 180 else
+            0.35 if estimated_hr <= 200 else
+            0.30 if estimated_hr <= 220 else
+            0.28 if estimated_hr <= 240 else
+            0.25
+        )
+
+        pr_max_ms = base_max_pr
+        if rr_ms_local is not None:
+            pr_max_ms = min(base_max_pr, int(rr_ms_local * rr_cap_pct))
+
+        if pr_max_ms <= pr_min_ms:
             return 0
 
-        p_onset = pl + np.argmax(np.abs(np.diff(sig[pl:pr])))
+        # Use atrial vector (Lead I + aVF) when available; otherwise use Lead II
+        p_source = sig
+        try:
+            if median_beat_i is not None and median_beat_avf is not None:
+                mb_i = np.asarray(median_beat_i, dtype=float)
+                mb_a = np.asarray(median_beat_avf, dtype=float)
+                if len(mb_i) == len(sig_raw) and len(mb_a) == len(sig_raw):
+                    atrial = mb_i + mb_a
+                    r_ref = int(np.argmin(np.abs(time_axis)))
+                    tp_s = max(0, r_ref - int(0.30 * fs))
+                    tp_e = max(tp_s + 1, r_ref - int(0.15 * fs))
+                    base = np.median(atrial[tp_s:tp_e]) if tp_e > tp_s else np.median(atrial[:max(1, int(0.05 * fs))])
+                    p_source = (atrial - base) - np.mean(atrial - base)
+        except Exception:
+            p_source = sig
 
-        PR = (qrs_start - p_onset) / fs * 1000
+        # Search window before QRS onset: [qrs_start - pr_max, qrs_start - pr_min]
+        left  = max(0, qrs_start - int(pr_max_ms * fs / 1000.0))
+        right = max(0, qrs_start - int(pr_min_ms * fs / 1000.0))
+        right = min(right, len(p_source) - 1)
+        if right <= left or left >= len(p_source):
+            return 0
+
+        r_ref = int(np.argmin(np.abs(time_axis)))
+        r_ref = max(0, min(r_ref, len(p_source) - 1))
+        r_amp = float(np.abs(p_source[r_ref]))
+        if not np.isfinite(r_amp) or r_amp <= 1e-9:
+            return 0
+
+        # Amplitude gates for P candidates (more lenient at high HR)
+        min_p_amp = (
+            0.05 * r_amp if estimated_hr <= 100 else
+            0.03 * r_amp if estimated_hr <= 140 else
+            0.02 * r_amp if estimated_hr <= 180 else
+            0.015 * r_amp
+        )
+        max_p_amp = 0.60 * r_amp
+
+        # Collect local maxima candidates
+        candidates = []
+        for idx in range(left, right):
+            a = float(np.abs(p_source[idx]))
+            if a < min_p_amp or a > max_p_amp:
+                continue
+            if idx > left and idx < len(p_source) - 1:
+                if p_source[idx] <= p_source[idx - 1] or p_source[idx] <= p_source[idx + 1]:
+                    continue
+            candidates.append((idx, a))
+
+        if not candidates:
+            # Fallback: legacy onset proxy (max diff) within a conservative window
+            pl = max(0, Q_onset - int(0.25 * fs))
+            pr = max(pl + 2, Q_onset - int(0.05 * fs))
+            pr = min(pr, len(sig) - 1)
+            if pr <= pl + 1:
+                return 0
+            p_onset = pl + int(np.argmax(np.abs(np.diff(sig[pl:pr]))))
+            PR = (qrs_start - p_onset) / fs * 1000.0
+            return int(round(PR)) if 40 <= PR <= 350 else 0
+
+        # Choose best candidate: proximity-weighted at higher HR
+        if estimated_hr > 120 and len(candidates) > 1:
+            proximity_weight = (
+                0.90 if estimated_hr > 200 else
+                0.85 if estimated_hr > 160 else
+                0.80 if estimated_hr > 140 else
+                0.75
+            )
+            win_samples = max(1.0, float(right - left))
+
+            def _score(item):
+                idx, amp = item
+                dist = float(r_ref - idx)
+                proximity = 1.0 - (dist / win_samples)
+                proximity = max(0.0, min(1.0, proximity))
+                amplitude_score = float(amp / r_amp)
+                return proximity * proximity_weight + amplitude_score * (1.0 - proximity_weight)
+
+            p_peak = max(candidates, key=_score)[0]
+        else:
+            p_peak = max(candidates, key=lambda x: x[1])[0]
+
+        # Convert P-peak to P-onset by walking backward to near-baseline
+        onset = left
+        baseline_th = max(0.30 * min_p_amp, 0.01 * r_amp)
+        for j in range(p_peak, left, -1):
+            if float(np.abs(p_source[j])) < baseline_th:
+                onset = j
+                break
+
+        PR = (qrs_start - onset) / fs * 1000.0
+        if PR < 40 or PR > 350:
+            return 0
         return int(round(PR))
 
     except Exception as e:
@@ -933,68 +1092,7 @@ def detect_qrs_offset_slope_assisted(signal_corrected, r_idx, fs, tp_baseline, q
         return None
 
 
-def measure_qrs_duration_from_median_beat(median_beat, time_axis, fs, tp_baseline):
-    """
-    Measure QRS duration from median beat: QRS onset → J-point (GE/Philips standard).
-
-    Uses slope-assisted detection for accurate QRS boundaries.
-    """
-    try:
-        r_idx = np.argmin(np.abs(time_axis))
-
-        signal_corrected = median_beat - tp_baseline
-
-        tp_start = max(0, r_idx - int(300 * fs / 1000))
-        tp_end   = max(0, r_idx - int(150 * fs / 1000))
-        noise_floor = (np.std(signal_corrected[tp_start:tp_end])
-                       if tp_end > tp_start
-                       else np.std(signal_corrected) * 0.1)
-
-        qrs_window_start = max(0, r_idx - int(60 * fs / 1000))
-        qrs_window_end   = min(len(signal_corrected), r_idx + int(80 * fs / 1000))
-        qrs_window       = signal_corrected[qrs_window_start:qrs_window_end]
-        qrs_peak_amplitude = (np.max(np.abs(qrs_window))
-                              if len(qrs_window) > 0
-                              else np.max(np.abs(signal_corrected)))
-
-        qrs_onset_idx = detect_qrs_onset_slope_assisted(
-            signal_corrected, r_idx, fs, tp_baseline, noise_floor
-        )
-
-        if qrs_onset_idx is None:
-            signal_range  = np.max(np.abs(signal_corrected))
-            threshold     = max(0.05 * signal_range, noise_floor * 3.0)
-            qrs_onset_start = max(0, r_idx - int(80 * fs / 1000))
-            qrs_segment   = signal_corrected[qrs_onset_start:r_idx]
-            deviations    = np.where(np.abs(qrs_segment) > threshold * 2.0)[0]
-            qrs_onset_idx = (qrs_onset_start + deviations[0]
-                             if len(deviations) > 0 else qrs_onset_start)
-
-        if qrs_onset_idx is None or not (0 <= qrs_onset_idx < len(signal_corrected)):
-            print(" ⚠️ QRS duration calculation failed: invalid onset index")
-            return None
-
-        j_point_idx = detect_qrs_offset_slope_assisted(
-            signal_corrected, r_idx, fs, tp_baseline, qrs_peak_amplitude
-        )
-
-        if j_point_idx is None:
-            j_start = r_idx + int(20 * fs / 1000)
-            j_end   = min(len(signal_corrected), r_idx + int(80 * fs / 1000))
-            j_point_idx = (j_start + np.argmin(signal_corrected[j_start:j_end])
-                           if j_end > j_start else None)
-            if j_point_idx is None:
-                return 0
-
-        qrs_ms = time_axis[j_point_idx] - time_axis[qrs_onset_idx]
-
-        if 40 <= qrs_ms <= 200:
-            return int(round(qrs_ms))
-        return 0
-
-    except Exception as e:
-        print(f" ⚠️ Error measuring QRS duration: {e}")
-        return 0
+from .qrs_detection import measure_qrs_duration_paper as measure_qrs_duration_from_median_beat
 
 
 def calculate_axis_from_median_beat(lead_i_raw, lead_ii_raw, lead_avf_raw,

@@ -131,50 +131,20 @@ def calculate_qtc_bazett(qt_ms: float, rr_ms: float) -> int:
 def calculate_qtc_auto(qt_ms: float, rr_ms: float, heart_rate: int,
                         instance_id: Optional[str] = None) -> int:
     """
-    Calculate QTc using the appropriate formula based on heart rate.
+    Calculate QTc using Bazett formula at ALL heart rates.
 
-    FIX #14: Added hysteresis on formula switching to prevent QTc from
-    jumping every beat when HR oscillates near the 55 or 100 BPM thresholds.
-
-    Switching rules with hysteresis bands:
-    - Currently Bazett  → switch to Fridericia only if HR < 52 or HR > 103
-    - Currently Frider. → switch to Bazett        only if 58 ≤ HR ≤ 97
-
-    Initial assignment (first call or no prior state):
-    - Fridericia if HR < 55 or HR > 100, else Bazett.
+    Fridericia formula removed — Bazett is used universally.
 
     Args:
-        qt_ms:       QT interval in milliseconds.
-        rr_ms:       RR interval in milliseconds.
-        heart_rate:  Heart rate in BPM.
-        instance_id: Key for per-instance formula state (optional).
+        qt_ms:       QT interval in ms.
+        rr_ms:       RR interval in ms.
+        heart_rate:  Heart rate in BPM (unused, kept for API compatibility).
+        instance_id: Unused, kept for API compatibility.
 
     Returns:
-        QTc in milliseconds using the selected formula.
+        QTc in ms (Bazett).
     """
-    key = instance_id if instance_id is not None else 'global'
-
-    # Determine current formula with hysteresis
-    if key not in _qtc_formula_state:
-        # Initial assignment — no hysteresis needed
-        _qtc_formula_state[key] = (
-            'fridericia' if (heart_rate < 55 or heart_rate > 100) else 'bazett'
-        )
-    else:
-        current = _qtc_formula_state[key]
-        if current == 'bazett':
-            # Switch away from Bazett only if clearly outside normal range
-            if heart_rate < 52 or heart_rate > 103:
-                _qtc_formula_state[key] = 'fridericia'
-        else:  # fridericia
-            # Switch back to Bazett only if clearly in normal range
-            if 58 <= heart_rate <= 97:
-                _qtc_formula_state[key] = 'bazett'
-
-    if _qtc_formula_state[key] == 'fridericia':
-        return calculate_qtcf_interval(qt_ms, rr_ms)
-    else:
-        return calculate_qtc_bazett(qt_ms, rr_ms)
+    return calculate_qtc_bazett(qt_ms, rr_ms)
 
 
 def calculate_rv5_sv1_from_median(data: list, r_peaks: np.ndarray,

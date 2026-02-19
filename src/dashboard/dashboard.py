@@ -2436,10 +2436,10 @@ class Dashboard(QWidget):
         """Update dashboard metrics with live calculated values"""
         try:
             import time as _time
-            # Throttle: reduced to 1s for better responsiveness while maintaining stability
+            # Throttle: reduced to 0.3s for much faster responsiveness (real-time)
             if not hasattr(self, '_last_metrics_update_ts'):
                 self._last_metrics_update_ts = 0.0
-            if _time.time() - self._last_metrics_update_ts < 1.0:
+            if _time.time() - self._last_metrics_update_ts < 0.3:
                 return
             self._last_metrics_update_ts = _time.time()
             # Do not update metrics for first-time users until acquisition/demo starts
@@ -2480,9 +2480,9 @@ class Dashboard(QWidget):
             since_last = now - self._last_interval_metrics_ts
 
             # Only redraw PR/QRS/P/QT/QTc if:
-            #  - at least 6 seconds have passed, AND
+            #  - at least 1.0 second has passed (reduced from 6s for real-time), AND
             #  - the values actually changed since last update
-            if since_last >= 6.0 and interval_snapshot != self._last_interval_metrics_values:
+            if since_last >= 1.0 and interval_snapshot != self._last_interval_metrics_values:
                 # Update PR Interval
                 if pr_val is not None and 'pr_interval' in self.metric_labels:
                     self.metric_labels['pr_interval'].setText(f"{pr_val} ms")
@@ -2798,10 +2798,10 @@ class Dashboard(QWidget):
     
     def update_ecg_metrics(self, intervals):
         import time as _time
-        # Throttle: update at most once every 0.5 seconds
+        # Throttle: reduced to 0.3s for much faster responsiveness (real-time)
         if not hasattr(self, '_last_metrics_update_ts'):
             self._last_metrics_update_ts = 0.0
-        if _time.time() - self._last_metrics_update_ts < 0.5:
+        if _time.time() - self._last_metrics_update_ts < 0.3:
             return
         if 'Heart_Rate' in intervals and intervals['Heart_Rate'] is not None:
             self.metric_labels['heart_rate'].setText(
@@ -2933,9 +2933,10 @@ class Dashboard(QWidget):
     def update_dashboard_metrics_from_ecg(self):
         try:
             import time as _time
+            # Throttle: reduced to 0.3s for much faster responsiveness (real-time)
             if not hasattr(self, '_last_metrics_update_ts'):
                 self._last_metrics_update_ts = 0.0
-            if _time.time() - self._last_metrics_update_ts < 1.0:
+            if _time.time() - self._last_metrics_update_ts < 0.3:
                 return
             self._last_metrics_update_ts = _time.time()
             if not self.is_ecg_active():
