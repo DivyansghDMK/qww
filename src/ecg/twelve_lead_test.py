@@ -6933,12 +6933,25 @@ class ECGTestPage(QWidget):
                 plot_data = np.full(buffer_len, np.nan)
                 
                 if data is not None and len(data) > 0:
-                    # Take exactly buffer_len samples from the end (same as main plots)
-                    # This ensures overlay matches main view for all wave speeds
-                    if len(data) >= buffer_len:
-                        data_segment = data[-buffer_len:]
+                    # 12:1 overlay waves appear immediately at acquisition start.
+                    try:
+                        raw_data = np.asarray(data, dtype=float)
+                        non_zero_indices = np.where(raw_data != 0)[0]
+                        if len(non_zero_indices) > 0:
+                            first_real_idx = int(non_zero_indices[0])
+                            recent_data = raw_data[first_real_idx:]
+                        else:
+                            recent_data = raw_data[-min(buffer_len, len(raw_data)):] if len(raw_data) > 0 else raw_data
+                    except Exception:
+                        raw_data = np.asarray(data, dtype=float)
+                        recent_data = raw_data
+
+                    # Take exactly buffer_len samples from the tail of recent_data
+                    # so overlay and main grid show the same active window.
+                    if len(recent_data) >= buffer_len:
+                        data_segment = recent_data[-buffer_len:]
                     else:
-                        data_segment = data
+                        data_segment = recent_data
                     
                     # Optional AC notch filtering (match main 12-lead grid view)
                     filtered_segment = np.array(data_segment, dtype=float)
@@ -6974,6 +6987,13 @@ class ECGTestPage(QWidget):
                             filtered_segment = apply_ac_filter(filtered_segment, sampling_rate, ac_setting)
                     except Exception as filter_error:
                         print(f" Overlay AC filter skipped for lead {lead}: {filter_error}")
+
+                    # Gaussian smoothing
+                    try:
+                        if len(filtered_segment) > 5:
+                            filtered_segment = gaussian_filter1d(filtered_segment, sigma=self.SMOOTH_SIGMA)
+                    except Exception:
+                        pass
                     
                     # Apply same baseline correction as main 12-lead grid view
                     raw = np.array(filtered_segment, dtype=float)
@@ -7224,7 +7244,7 @@ class ECGTestPage(QWidget):
         try:
             from matplotlib.lines import Line2D
 
-            bg_color = '#FFFFFF'
+            bg_color = '#ffe7eb'
             minor_color = '#ffd1d1'
             major_color = '#ffb3b3'
             
@@ -7698,12 +7718,25 @@ class ECGTestPage(QWidget):
                 plot_data = np.full(buffer_len, np.nan)
                 
                 if data is not None and len(data) > 0:
-                    # Take exactly buffer_len samples from the end (same as main plots)
-                    # This ensures overlay matches main view for all wave speeds
-                    if len(data) >= buffer_len:
-                        data_segment = data[-buffer_len:]
+                    # 6:2 overlay waves appear immediately at acquisition start.
+                    try:
+                        raw_data = np.asarray(data, dtype=float)
+                        non_zero_indices = np.where(raw_data != 0)[0]
+                        if len(non_zero_indices) > 0:
+                            first_real_idx = int(non_zero_indices[0])
+                            recent_data = raw_data[first_real_idx:]
+                        else:
+                            recent_data = raw_data[-min(buffer_len, len(raw_data)):] if len(raw_data) > 0 else raw_data
+                    except Exception:
+                        raw_data = np.asarray(data, dtype=float)
+                        recent_data = raw_data
+
+                    # Take exactly buffer_len samples from the tail of recent_data
+                    # so overlay and main grid show the same active window.
+                    if len(recent_data) >= buffer_len:
+                        data_segment = recent_data[-buffer_len:]
                     else:
-                        data_segment = data
+                        data_segment = recent_data
                     
                     # Optional AC notch filtering (match main 12-lead grid view)
                     filtered_segment = np.array(data_segment, dtype=float)
@@ -7738,6 +7771,13 @@ class ECGTestPage(QWidget):
                             filtered_segment = apply_ac_filter(filtered_segment, sampling_rate, ac_setting)
                     except Exception as filter_error:
                         print(f" 6:2 overlay AC filter skipped for lead {lead}: {filter_error}")
+
+                    # Gaussian smoothing
+                    try:
+                        if len(filtered_segment) > 5:
+                            filtered_segment = gaussian_filter1d(filtered_segment, sigma=self.SMOOTH_SIGMA)
+                    except Exception:
+                        pass
                     
                     # Apply same baseline correction as main 12-lead grid view
                     raw = np.array(filtered_segment, dtype=float)

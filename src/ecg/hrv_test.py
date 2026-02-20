@@ -1088,6 +1088,7 @@ class HRVTestWindow(QWidget):
                 pr_val = metrics.get('pr_interval', '0')
                 qrs_val = metrics.get('qrs_duration', '0')
                 st_val = metrics.get('st_interval', '0')
+                qt_val = metrics.get('qt_interval', '0')
                 qtc_val = metrics.get('qtc_interval', '0')
 
                 # Update UI labels with identical formatting to 12-lead test
@@ -1106,11 +1107,11 @@ class HRVTestWindow(QWidget):
                         p_text = f"{st_val} ms" if st_val != '0' else "0 ms"
                     self.metric_labels['st_interval'].setText(p_text)
                 if 'qtc_interval' in self.metric_labels:
-                    # 12-lead test might return "QT/QTc", handle both
-                    if '/' in str(qtc_val):
-                        self.metric_labels['qtc_interval'].setText(f"{qtc_val} ms")
+                    # Prefer explicit QT + QTc if available; fall back to QTc only
+                    if qt_val not in ('', '0') and qtc_val not in ('', '0'):
+                        self.metric_labels['qtc_interval'].setText(f"{qt_val}/{qtc_val} ms")
                     else:
-                        self.metric_labels['qtc_interval'].setText(f"{qtc_val} ms" if qtc_val != '0' else "0 ms")
+                        self.metric_labels['qtc_interval'].setText(f"{qtc_val} ms" if qtc_val not in ('', '0') else "0 ms")
             else:
                 # Fallback if calculator not available
                 for key in self.metric_labels:
