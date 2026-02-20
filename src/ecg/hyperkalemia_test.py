@@ -804,6 +804,7 @@ class HyperkalemiaTestWindow(QWidget):
                 hr_val = metrics.get('heart_rate', '0')
                 pr_val = metrics.get('pr_interval', '0')
                 qrs_val = metrics.get('qrs_duration', '0')
+                qt_val = metrics.get('qt_interval', '0')
                 qtc_val = metrics.get('qtc_interval', '0')
 
                 print(f"Heart Rate: {hr_val} BPM, PR Interval: {pr_val} ms, QRS Duration: {qrs_val} ms, QTC Interval: {qtc_val} ms")
@@ -815,7 +816,11 @@ class HyperkalemiaTestWindow(QWidget):
                 if 'qrs_duration' in self.metric_labels:
                     self.metric_labels['qrs_duration'].setText(f"{qrs_val} ms" if qrs_val != '0' else "0 ms")
                 if 'qtc_interval' in self.metric_labels:
-                    self.metric_labels['qtc_interval'].setText(f"{qtc_val} ms" if qtc_val != '0' else "0 ms")
+                    # Prefer explicit QT + QTc if available; fall back to QTc only
+                    if qt_val not in ('', '0') and qtc_val not in ('', '0'):
+                        self.metric_labels['qtc_interval'].setText(f"{qt_val}/{qtc_val} ms")
+                    else:
+                        self.metric_labels['qtc_interval'].setText(f"{qtc_val} ms" if qtc_val not in ('', '0') else "0 ms")
         
         except Exception as e:
             pass

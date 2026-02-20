@@ -1683,6 +1683,17 @@ class ExpandedLeadView(QDialog):
 
             start_idx = int(self.view_window_offset * self.sampling_rate)
             end_idx = min(total_samples, start_idx + window_samples)
+
+            try:
+                non_zero_indices = np.where(self.ecg_data != 0)[0]
+                if len(non_zero_indices) > 0:
+                    first_real_idx = int(non_zero_indices[0])
+                    if first_real_idx > start_idx:
+                        start_idx = first_real_idx
+                        end_idx = min(total_samples, start_idx + window_samples)
+            except Exception:
+                pass
+
             if end_idx - start_idx <= 1:
                 return
 
