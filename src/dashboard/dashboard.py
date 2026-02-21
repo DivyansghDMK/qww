@@ -406,6 +406,7 @@ class Dashboard(QWidget):
         # --- Device Connection Monitor ---
         self.device_connected = False
         self.device_port = None
+        self.device_version = None
         self.settings_manager = SettingsManager()
         self.device_check_timer = QTimer(self)
         self.device_check_timer.timeout.connect(self.check_device_connection)
@@ -4231,18 +4232,20 @@ class Dashboard(QWidget):
                     success, version, _ = handler.send_version_command(timeout=0.2)
                     ser.close()
                     
-                    if success:
+                    if success and version:
                         self.device_port = port.device
                         self.device_connected = True
+                        self.device_version = version
                         self.update_device_ui(True)
 
                         # Save to settings so test pages can use it
                         if hasattr(self, 'settings_manager'):
                             self.settings_manager.set_setting("serial_port", port.device)
                             self.settings_manager.set_setting("baud_rate", "115200")
+                            self.settings_manager.set_setting("hardware_version", version)
                             self.settings_manager.save_settings()
                             elapsed = time.time() - scan_start
-                            print(f"✅ Device found on {port.device} in {elapsed:.2f}s, saved to settings.")
+                            print(f"✅ Device found on {port.device} in {elapsed:.2f}s, saved to settings with version {version}.")
                         return
                 except Exception:
                     continue
@@ -4256,8 +4259,7 @@ class Dashboard(QWidget):
     def update_device_ui(self, connected):
         """Update UI elements based on device connection status"""
         if connected:
-            self.device_status_label.setText("Device Connected")
-            self.device_status_label.setStyleSheet("color: green; margin-right: 10px; font-weight: bold;")
+            self .device_status_label.setText( "Device Connected" )
             
             # Enable test buttons
             if hasattr(self, 'hrv_test_btn'):
