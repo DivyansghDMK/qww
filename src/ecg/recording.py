@@ -1928,10 +1928,18 @@ class ECGMenu(QGroupBox):
         info_layout = QVBoxLayout(info_frame)
         info_layout.setSpacing(15)
 
+        if not self.settings_manager:
+            self.settings_manager = SettingsManager()
+        hardware_version = ""
+        if self.settings_manager:
+            hardware_version = self.settings_manager.get_setting("hardware_version", "")
+        if not hardware_version:
+            hardware_version = "Not Detected"
+
         # Version details
         version_info = [
             (self.tr("Software Version"), "V 1.1.1"),
-            (self.tr("Hardware Version"), "V 1.5.2"),
+            (self.tr("Hardware Version"), hardware_version),
             (self.tr("Firmware Version"), "V.3.0.1"),
             (self.tr("Build Date"), "2024-08-26"),
             (self.tr("Manufacturer"), "Modular ECG Systems"),

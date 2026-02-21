@@ -11,6 +11,7 @@ class SettingsManager:
             "lead_sequence": "Standard",
             "serial_port": "Select Port",
             "baud_rate": "115200",
+            "hardware_version": "",
 
             # Report Setup settings
             "printer_average_wave": "on",

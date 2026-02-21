@@ -713,6 +713,7 @@ def main():
                         serial_id = ''
                         if isinstance(record, dict):
                             serial_id = str(record.get('serial_id', ''))
+                            
                         if serial_id:
                             crash_logger.set_machine_serial_id(serial_id)
                             os.environ['MACHINE_SERIAL_ID'] = serial_id
