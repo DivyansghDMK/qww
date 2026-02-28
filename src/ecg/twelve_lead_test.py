@@ -780,6 +780,18 @@ class ECGTestPage(QWidget):
         self.sampling_rate = 500  # Default sampling rate for expanded lead view
         self._latest_rhythm_interpretation = "Analyzing Rhythm..."
 
+        # ── HolterBPMController: stable BPM engine (background thread) ─────────
+        try:
+            from ecg.holter.holter_bpm_engine import HolterBPMController
+            self._bpm_ctrl = HolterBPMController(
+                parent_widget=self,
+                fs=500,
+                chunk_seconds=10,
+            )
+        except Exception as _bpm_init_err:
+            print(f"[ECGTestPage] HolterBPMController init failed: {_bpm_init_err}")
+            self._bpm_ctrl = None
+
         # Flatline detection state: track leads where we've already shown an alert
         self._flatline_alert_shown = [False] * 12
         self._prev_p_axis = None  # Track P-axis for safety assertions
@@ -5720,6 +5732,27 @@ class ECGTestPage(QWidget):
         timer_interval = 20  # 50 FPS
         self.timer.start(timer_interval)
         QTimer.singleShot(10, self.update_plots)   # instant first frame
+
+        # ── Start HolterBPMController (stable BPM engine) ─────────────────────
+        try:
+            if self._bpm_ctrl is not None:
+                if self._bpm_ctrl.is_running:
+                    self._bpm_ctrl.stop()
+                self._bpm_ctrl.start(target_hours=0)
+                # Attach display bar at the top of main layout if not already there
+                try:
+                    main_layout = self.layout()
+                    if main_layout and self._bpm_ctrl.display_bar is not None:
+                        existing = [main_layout.itemAt(i).widget()
+                                    for i in range(main_layout.count())
+                                    if main_layout.itemAt(i).widget() is not None]
+                        if self._bpm_ctrl.display_bar not in existing:
+                            main_layout.insertWidget(0, self._bpm_ctrl.display_bar)
+                        self._bpm_ctrl.display_bar.show()
+                except Exception:
+                    pass
+        except Exception as _bpm_start_err:
+            print(f"[ECGTestPage] BPM controller start error: {_bpm_start_err}")
         if hasattr(self, '_12to1_timer'):
             self._12to1_timer.start(100)
 
@@ -5856,6 +5889,15 @@ class ECGTestPage(QWidget):
         # UPDATE STATE: Test stopped
         if hasattr(self, 'dashboard_instance') and self.dashboard_instance:
             self.dashboard_instance.update_test_state("12_lead_test", False)
+
+        # ── Stop HolterBPMController ──────────────────────────────────────────
+        try:
+            if self._bpm_ctrl is not None and self._bpm_ctrl.is_running:
+                self._bpm_ctrl.stop()
+                if self._bpm_ctrl.display_bar is not None:
+                    self._bpm_ctrl.display_bar.hide()
+        except Exception as _bpm_stop_err:
+            print(f"[ECGTestPage] BPM controller stop error: {_bpm_stop_err}")
 
         port = self.settings_manager.get_serial_port()
         baud = self.settings_manager.get_baud_rate()
@@ -8321,7 +8363,14 @@ class ECGTestPage(QWidget):
                         # Packet contains all 12 leads: I, II, III, aVR, aVL, aVF, V1, V2, V3, V4, V5, V6
                         # Map packet dict to our lead order
                         lead_order = ["I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"]
-                        
+
+                        # ── Feed packet to HolterBPMController (fast, non-blocking) ───────
+                        try:
+                            if self._bpm_ctrl is not None:
+                                self._bpm_ctrl.push(packet)
+                        except Exception:
+                            pass
+
                         for i, lead_name in enumerate(lead_order):
                             try:
                                 if i < len(self.data) and lead_name in packet:

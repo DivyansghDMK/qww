@@ -132,6 +132,18 @@ class HRVTestWindow(QWidget):
                 traceback.print_exc()
                 self.ecg_calculator = None
         
+        # ── HolterBPMController: stable BPM engine (background thread) ─────────
+        try:
+            from ecg.holter.holter_bpm_engine import HolterBPMController
+            self._bpm_ctrl = HolterBPMController(
+                parent_widget=self,
+                fs=500,
+                chunk_seconds=10,
+            )
+        except Exception as _e:
+            print(f"[HRVTestWindow] HolterBPMController init failed: {_e}")
+            self._bpm_ctrl = None
+
         # Initialize UI
         self.init_ui()
         
@@ -446,6 +458,23 @@ class HRVTestWindow(QWidget):
             self.report_btn.setEnabled(False)
             self.lead_combo.setEnabled(False)
 
+            # ── Start HolterBPMController ───────────────────────────────────────
+            try:
+                if self._bpm_ctrl is not None:
+                    if self._bpm_ctrl.is_running:
+                        self._bpm_ctrl.stop()
+                    self._bpm_ctrl.start(target_hours=0)
+                    main_layout = self.layout()
+                    if main_layout and self._bpm_ctrl.display_bar is not None:
+                        existing = [main_layout.itemAt(i).widget()
+                                    for i in range(main_layout.count())
+                                    if main_layout.itemAt(i).widget() is not None]
+                        if self._bpm_ctrl.display_bar not in existing:
+                            main_layout.insertWidget(0, self._bpm_ctrl.display_bar)
+                        self._bpm_ctrl.display_bar.show()
+            except Exception as _bpm_err:
+                print(f"[HRVTestWindow] BPM controller start error: {_bpm_err}")
+
             # Lock display interaction during capture
             self.plot_widget.setMouseEnabled(x=False, y=False)
 
@@ -489,6 +518,15 @@ class HRVTestWindow(QWidget):
             except:
                 pass
             self.serial_reader = None
+        
+        # ── Stop HolterBPMController ────────────────────────────────────────
+        try:
+            if self._bpm_ctrl is not None and self._bpm_ctrl.is_running:
+                self._bpm_ctrl.stop()
+                if self._bpm_ctrl.display_bar is not None:
+                    self._bpm_ctrl.display_bar.hide()
+        except Exception as _bpm_err:
+            print(f"[HRVTestWindow] BPM controller stop error: {_bpm_err}")
         
         # Stop timers
         self.capture_timer.stop()
@@ -581,6 +619,13 @@ class HRVTestWindow(QWidget):
                 # Packet is a dictionary with lead names as keys (e.g., {"I": value, "II": value, ...})
                 # Extract selected lead directly from the packet
                 lead_value = packet.get(self.selected_lead, None)
+
+                # ── Feed packet to HolterBPMController ──────────────────────────
+                try:
+                    if self._bpm_ctrl is not None:
+                        self._bpm_ctrl.push(packet)
+                except Exception:
+                    pass
                 
                 if lead_value is not None:
                     lead_value = float(lead_value)

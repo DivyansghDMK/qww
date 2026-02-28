@@ -159,6 +159,18 @@ class HyperkalemiaTestWindow(QWidget):
                 traceback.print_exc()
                 self.ecg_calculator = None
         
+        # ── HolterBPMController: stable BPM engine (background thread) ─────────
+        try:
+            from ecg.holter.holter_bpm_engine import HolterBPMController
+            self._bpm_ctrl = HolterBPMController(
+                parent_widget=self,
+                fs=500,
+                chunk_seconds=10,
+            )
+        except Exception as _e:
+            print(f"[HyperkalemiaTestWindow] HolterBPMController init failed: {_e}")
+            self._bpm_ctrl = None
+
         # Initialize UI
         self.init_ui()
         
@@ -533,6 +545,23 @@ class HyperkalemiaTestWindow(QWidget):
             self.status_label.setText("Status: Capturing from serial port...")
             self.status_label.setStyleSheet("color: #28a745; padding: 5px;")
             
+            # ── Start HolterBPMController ───────────────────────────────────────
+            try:
+                if self._bpm_ctrl is not None:
+                    if self._bpm_ctrl.is_running:
+                        self._bpm_ctrl.stop()
+                    self._bpm_ctrl.start(target_hours=0)
+                    main_layout = self.layout()
+                    if main_layout and self._bpm_ctrl.display_bar is not None:
+                        existing = [main_layout.itemAt(i).widget()
+                                    for i in range(main_layout.count())
+                                    if main_layout.itemAt(i).widget() is not None]
+                        if self._bpm_ctrl.display_bar not in existing:
+                            main_layout.insertWidget(0, self._bpm_ctrl.display_bar)
+                        self._bpm_ctrl.display_bar.show()
+            except Exception as _bpm_err:
+                print(f"[HyperkalemiaTestWindow] BPM controller start error: {_bpm_err}")
+            
             # Start timers
             self.capture_timer.start(50)  # Update plot every 50ms
             self.duration_timer.start(1000)  # Check duration every second
@@ -569,6 +598,15 @@ class HyperkalemiaTestWindow(QWidget):
             except:
                 pass
             self.serial_reader = None
+        
+        # ── Stop HolterBPMController ────────────────────────────────────────
+        try:
+            if self._bpm_ctrl is not None and self._bpm_ctrl.is_running:
+                self._bpm_ctrl.stop()
+                if self._bpm_ctrl.display_bar is not None:
+                    self._bpm_ctrl.display_bar.hide()
+        except Exception as _bpm_err:
+            print(f"[HyperkalemiaTestWindow] BPM controller stop error: {_bpm_err}")
         
         # Stop timers
         self.capture_timer.stop()
@@ -658,6 +696,13 @@ class HyperkalemiaTestWindow(QWidget):
             # Process each packet
             for packet in packets:
                 self.active_samples = min(len(self.data), self.active_samples + 1)
+
+                # ── Feed packet to HolterBPMController ──────────────────────────
+                try:
+                    if self._bpm_ctrl is not None:
+                        self._bpm_ctrl.push(packet)
+                except Exception:
+                    pass
 
                 self.sample_index += 1
                 packet_time = self.sample_index / 500.0
