@@ -1207,24 +1207,33 @@ class HRVTestWindow(QWidget):
                 except Exception as e:
                     print(f" calculate_ecg_metrics error in HRV test: {e}")
 
-                # FETCH SMOOTHED METRICS (Same logic as dashboard)
-                # get_current_metrics provides stable values, including HR smoothing
+                # FETCH METRICS DIRECTLY from the calculator's stored attributes.
+                # get_current_metrics() reads from UI label text, but ecg_calculator
+                # is a headless instance with no visible labels → always returns '0'.
+                # The attributes below are set by calculate_ecg_metrics() directly.
+                def _attr_to_str(attr_name, fallback='0'):
+                    v = getattr(self.ecg_calculator, attr_name, 0)
+                    try:
+                        iv = int(round(float(v))) if v else 0
+                        return str(iv) if iv > 0 else fallback
+                    except:
+                        return fallback
+
+                # Also try get_current_metrics as secondary source
                 metrics = self.ecg_calculator.get_current_metrics()
-                
-                # Extract values with fallbacks
-                hr_val = metrics.get('heart_rate', '0')
-                pr_val = metrics.get('pr_interval', '0')
-                qrs_val = metrics.get('qrs_duration', '0')
-                st_val = metrics.get('st_interval', '0')
-                qt_val = metrics.get('qt_interval', '0')
-                qtc_val = metrics.get('qtc_interval', '0')
+
+                hr_val  = metrics.get('heart_rate', '0')
+                pr_val  = _attr_to_str('pr_interval') or metrics.get('pr_interval', '0')
+                qrs_val = _attr_to_str('last_qrs_duration') or metrics.get('qrs_duration', '0')
+                qt_val  = _attr_to_str('last_qt_interval') or metrics.get('qt_interval', '0')
+                qtc_val = _attr_to_str('last_qtc_interval') or metrics.get('qtc_interval', '0')
+                st_val  = _attr_to_str('last_st_interval') or metrics.get('st_interval', '0')
 
                 # Check if HolterBPM is overriding HR
                 _bpm_active = (self._bpm_ctrl is not None and self._bpm_ctrl.is_running)
 
                 # Update UI labels with identical formatting to 12-lead test
                 if not _bpm_active and 'heart_rate' in self.metric_labels:
-                    # Dashboard uses "bpm", we use "BPM" for consistency with the rest of this UI
                     self.metric_labels['heart_rate'].setText(f"{hr_val} BPM" if hr_val != '0' else "00 BPM")
                 if 'pr_interval' in self.metric_labels:
                     self.metric_labels['pr_interval'].setText(f"{pr_val} ms" if pr_val != '0' else "0 ms")
@@ -1243,6 +1252,7 @@ class HRVTestWindow(QWidget):
                         self.metric_labels['qtc_interval'].setText(f"{qt_val}/{qtc_val} ms")
                     else:
                         self.metric_labels['qtc_interval'].setText(f"{qtc_val} ms" if qtc_val not in ('', '0') else "0 ms")
+
             else:
                 # Fallback if calculator not available
                 for key in self.metric_labels:

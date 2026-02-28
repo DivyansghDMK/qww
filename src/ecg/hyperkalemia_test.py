@@ -913,17 +913,34 @@ class HyperkalemiaTestWindow(QWidget):
                 except Exception as e:
                     print(f" calculate_ecg_metrics error in Hyperkalemia test: {e}")
 
-                # FETCH SMOOTHED METRICS
+                # FETCH METRICS DIRECTLY from the calculator's stored attributes.
+                # get_current_metrics() reads from UI label text, but ecg_calculator
+                # is a headless instance with no visible labels → always returns '0'.
+                # The attributes below are set by calculate_ecg_metrics() directly.
+                def _attr_to_str(attr_name, fallback='0'):
+                    v = getattr(self.ecg_calculator, attr_name, 0)
+                    try:
+                        iv = int(round(float(v))) if v else 0
+                        return str(iv) if iv > 0 else fallback
+                    except:
+                        return fallback
+
+                # Also call get_current_metrics as a secondary/fallback source
                 metrics = self.ecg_calculator.get_current_metrics()
                 self.last_metrics = dict(metrics) if isinstance(metrics, dict) else {}
-                print("metrics:", metrics)
-                
+
                 # Update UI labels
-                hr_val = metrics.get('heart_rate', '0')
-                pr_val = metrics.get('pr_interval', '0')
-                qrs_val = metrics.get('qrs_duration', '0')
-                qt_val = metrics.get('qt_interval', '0')
-                qtc_val = metrics.get('qtc_interval', '0')
+                hr_val  = metrics.get('heart_rate', '0')
+                pr_val  = _attr_to_str('pr_interval') or metrics.get('pr_interval', '0')
+                qrs_val = _attr_to_str('last_qrs_duration') or metrics.get('qrs_duration', '0')
+                qt_val  = _attr_to_str('last_qt_interval') or metrics.get('qt_interval', '0')
+                qtc_val = _attr_to_str('last_qtc_interval') or metrics.get('qtc_interval', '0')
+
+                # Also persist to last_metrics so report generation can use them
+                if pr_val != '0':  self.last_metrics['pr_interval'] = pr_val
+                if qrs_val != '0': self.last_metrics['qrs_duration'] = qrs_val
+                if qt_val != '0':  self.last_metrics['qt_interval'] = qt_val
+                if qtc_val != '0': self.last_metrics['qtc_interval'] = qtc_val
 
                 # Check if HolterBPM is overriding HR
                 _bpm_active = (self._bpm_ctrl is not None and self._bpm_ctrl.is_running)
@@ -942,6 +959,7 @@ class HyperkalemiaTestWindow(QWidget):
                         self.metric_labels['qtc_interval'].setText(f"{qt_val}/{qtc_val} ms")
                     else:
                         self.metric_labels['qtc_interval'].setText(f"{qtc_val} ms" if qtc_val not in ('', '0') else "0 ms")
+
         
         except Exception as e:
             pass
