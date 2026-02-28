@@ -478,7 +478,7 @@ class HRVTestWindow(QWidget):
                             self._bpm_refresh_timer = QTimer()
                             self._bpm_refresh_timer.timeout.connect(self._refresh_holter_bpm_label)
                         if not self._bpm_refresh_timer.isActive():
-                            self._bpm_refresh_timer.start(3000)
+                            self._bpm_refresh_timer.start(2000)
             except Exception as _bpm_err:
                 print(f"[HRVTestWindow] BPM controller start error: {_bpm_err}")
 

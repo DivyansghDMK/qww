@@ -73,9 +73,11 @@ LEAD_NAMES = ["I", "II", "III", "aVR", "aVL", "aVF",
               "V1", "V2", "V3", "V4", "V5", "V6"]
 LEAD_II_IDX = 1          # Lead II is always index 1
 
-# Chunk size for analysis (adaptive: shorter for short test windows)
-CHUNK_SECONDS = 10        # 10 s chunks → first BPM within 10 s
-FS_DEFAULT    = 500
+# Sliding window configuration
+WINDOW_SECONDS  = 10   # How many seconds of data to use per BPM calculation
+CALC_INTERVAL   = 2.0  # Recalculate every N seconds (fast response to HR changes)
+CHUNK_SECONDS   = WINDOW_SECONDS  # kept for backward-compat import
+FS_DEFAULT      = 500
 
 # Colours
 COL_BG        = "#0D1117"
@@ -205,34 +207,42 @@ class HolterBPMStore:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 3.  HolterBPMWorker
-#     Background thread: accumulates chunks → calculates BPM → updates store.
+#     SLIDING-WINDOW design:
+#     • keeps a ring-buffer of the last WINDOW_SECONDS of Lead II data
+#     • every CALC_INTERVAL seconds, runs HolterBPMCalculator on those samples
+#     • result is stored in HolterBPMStore → display reads it every 2 s
+#     Benefit: latency to a real HR change ≈ CALC_INTERVAL (≈2 s) instead of
+#              waiting for a full chunk to accumulate (was 10 s).
 # ══════════════════════════════════════════════════════════════════════════════
 class HolterBPMWorker(threading.Thread):
     """
     Sits between the serial reader and the UI.
-    push() is called 500×/s from the main thread — it is kept fast by just
-    filling a local numpy buffer.  Analysis runs entirely in this thread.
+    push() is called 500×/s — it ONLY writes into a ring buffer (O(1)).
+    A separate ticker inside the thread tasks the calculator every CALC_INTERVAL.
     """
 
     def __init__(self,
                  store: HolterBPMStore,
                  fs: int = FS_DEFAULT,
-                 chunk_seconds: int = CHUNK_SECONDS,
+                 chunk_seconds: int = WINDOW_SECONDS,   # kept for API compat
                  jsonl_path: str = "",
                  on_arrhythmia=None):
         super().__init__(daemon=True, name="HolterBPMWorker")
         self.store         = store
         self.fs            = fs
-        self.chunk_size    = chunk_seconds * fs
+        self.window_size   = chunk_seconds * fs          # ring-buffer length
         self.jsonl_path    = jsonl_path
         self.on_arrhythmia = on_arrhythmia
 
-        self._q             = queue.Queue(maxsize=20)
-        self._stop_evt      = threading.Event()
-        self._chunk_buf     = np.zeros((12, self.chunk_size), dtype=np.float32)
-        self._chunk_ptr     = 0
-        self._total_frames  = 0
-        self._calculator    = HolterBPMCalculator(fs=fs)
+        # ── Ring buffer for Lead II only (saves memory vs. storing all 12 leads) ──
+        self._ring         = np.zeros(self.window_size, dtype=np.float32)
+        self._ring_ptr     = 0       # next write position
+        self._ring_count   = 0       # samples written so far (capped at window_size)
+        self._ring_lock    = threading.Lock()
+
+        self._stop_evt     = threading.Event()
+        self._calculator   = HolterBPMCalculator(fs=fs)
+        self._total_frames = 0
 
         # Optional arrhythmia detector
         self._arrhy_detector = None
@@ -245,72 +255,76 @@ class HolterBPMWorker(threading.Thread):
     # ── Called 500× per second from the Qt main thread ────────────────────
     def push(self, packet: dict):
         """
-        Packet dict: {"I": val, "II": val, ... "V6": val}.
-        Fills the chunk buffer. When full → queues for analysis.
+        Extracts Lead II and writes into the ring buffer.
+        This is the hot path — must stay O(1) with no allocation.
         """
-        cp = self._chunk_ptr
-        for i, lead in enumerate(LEAD_NAMES):
-            self._chunk_buf[i, cp] = float(packet.get(lead, 2048))
-        self._chunk_ptr   += 1
+        val = float(packet.get("II", packet.get(LEAD_NAMES[LEAD_II_IDX], 2048)))
+        with self._ring_lock:
+            self._ring[self._ring_ptr] = val
+            self._ring_ptr = (self._ring_ptr + 1) % self.window_size
+            if self._ring_count < self.window_size:
+                self._ring_count += 1
         self._total_frames += 1
 
-        if self._chunk_ptr >= self.chunk_size:
-            snapshot  = self._chunk_buf.copy()
-            start_sec = (self._total_frames - self.chunk_size) / self.fs
-            try:
-                self._q.put_nowait({'data': snapshot,
-                                    'start_sec': start_sec,
-                                    'fs': self.fs})
-            except queue.Full:
-                pass  # analysis is slow — drop chunk but keep UI flowing
-            self._chunk_ptr = 0
-
-    # ── Thread main loop ──────────────────────────────────────────────────
+    # ── Thread main loop — ticker every CALC_INTERVAL seconds ─────────────
     def run(self):
-        print("[HolterBPMWorker] Started")
+        print("[HolterBPMWorker] Started (sliding-window mode)")
+        last_calc = 0.0
+        min_samples = self.fs * 3   # require at least 3 s of data
+
         while not self._stop_evt.is_set():
-            try:
-                item = self._q.get(timeout=2.0)
-            except queue.Empty:
+            time.sleep(0.2)          # lightweight polling (200 ms)
+
+            now = time.time()
+            if now - last_calc < CALC_INTERVAL:
                 continue
-            if item is None:
-                break
-            self._process(item)
-            self._q.task_done()
+            last_calc = now
+
+            # ── Snapshot the ring buffer ───────────────────────────────────
+            with self._ring_lock:
+                count = self._ring_count
+                if count < min_samples:
+                    continue        # not enough data yet
+                # Build a chronological slice of the ring buffer
+                if count >= self.window_size:
+                    # Buffer is full — rearrange so oldest sample is first
+                    ptr = self._ring_ptr
+                    lead_ii = np.concatenate(
+                        [self._ring[ptr:], self._ring[:ptr]]
+                    ).copy()
+                else:
+                    # Buffer not yet full — just take first `count` samples
+                    lead_ii = self._ring[:count].copy()
+
+            self._process(lead_ii)
+
         print("[HolterBPMWorker] Stopped")
 
     def stop(self):
         self._stop_evt.set()
-        try:
-            self._q.put_nowait(None)
-        except queue.Full:
-            pass
 
     # ── Core processing (runs in background thread) ───────────────────────
-    def _process(self, item: dict):
-        data:      np.ndarray = item['data']
-        start_sec: float      = item['start_sec']
-        fs:        int        = item.get('fs', self.fs)
-
-        lead_ii = data[LEAD_II_IDX] if data.shape[0] > 1 else data[0]
+    def _process(self, lead_ii: np.ndarray):
+        start_sec = self._total_frames / self.fs
 
         # ── Calculate BPM ─────────────────────────────────────────────────
-        bpm = self._calculator.calculate(lead_ii, fs=fs)
+        bpm = self._calculator.calculate(lead_ii, fs=self.fs)
 
         # ── Detect arrhythmias ────────────────────────────────────────────
         arrhythmias = []
         if self._arrhy_detector is not None and bpm > 0:
             try:
                 from scipy.signal import butter, filtfilt, find_peaks
-                low  = max(0.01, 5  / (fs / 2))
-                high = min(0.99, 20 / (fs / 2))
+                low  = max(0.01, 5  / (self.fs / 2))
+                high = min(0.99, 20 / (self.fs / 2))
                 b, a = butter(2, [low, high], btype='band')
                 filt = filtfilt(b, a, lead_ii.astype(float))
                 sq   = filt ** 2
-                win  = max(1, int(0.15 * fs))
+                win  = max(1, int(0.15 * self.fs))
                 env  = np.convolve(sq, np.ones(win) / win, mode='same')
                 thr  = np.mean(env) * 0.4
-                r_peaks, _ = find_peaks(env, height=thr, distance=max(1, int(0.12 * fs)))
+                r_peaks, _ = find_peaks(env, height=thr,
+                                        distance=max(1, int(0.12 * self.fs)))
                 if len(r_peaks) >= 3:
                     ad = {'r_peaks': r_peaks, 'p_peaks': [],
                           'q_peaks': [], 's_peaks': [], 't_peaks': []}
@@ -491,10 +505,10 @@ class HolterBPMDisplay(QFrame):
         self._clock_timer.timeout.connect(self._update_clock)
         self._clock_timer.start(1000)
 
-        # ★ BPM refresh — reads from store every 3 s (Qt main thread only)
+        # ★ BPM refresh — reads from store every 2 s (Qt main thread only)
         self._bpm_timer = QTimer(self)
         self._bpm_timer.timeout.connect(self._refresh_bpm)
-        self._bpm_timer.start(3000)
+        self._bpm_timer.start(2000)
 
     # ── ★ BPM refresh ─────────────────────────────────────────────────────
     def _refresh_bpm(self):
