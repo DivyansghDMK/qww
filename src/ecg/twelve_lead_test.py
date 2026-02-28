@@ -2035,7 +2035,10 @@ class ECGTestPage(QWidget):
         else:
             # We STILL want `heart_rate` to be assigned so that anything later in this function
             # doesn't crash (though most skip local HR things if not needed).
-            heart_rate = self.last_heart_rate
+            heart_rate = getattr(self, 'last_heart_rate', heart_rate_raw)
+            # Recompute rr_ms so QT/QTc ratio perfectly mirrors the displayed stable BPM (e.g. at 60BPM, RR=1000ms -> QTc=QT)
+            if heart_rate > 0:
+                rr_ms = 60000.0 / heart_rate
 
         
         # Calculate PR Interval using atrial vector method (Lead I + aVF) - GE/Philips/Fluke standard
@@ -2256,65 +2259,11 @@ class ECGTestPage(QWidget):
             if user_metrics["qtc_interval"] is not None:
                 qtc_interval_raw = user_metrics["qtc_interval"]
             
-            # STABILIZATION: Smooth QTc with buffer
-            if not hasattr(self, '_qtc_smooth_buffer'):
-                self._qtc_smooth_buffer = []
-            if qtc_interval_raw > 0:
-                self._qtc_smooth_buffer.append(qtc_interval_raw)
-                if len(self._qtc_smooth_buffer) > 20:  # Increased from 7 to 20 for better stability
-                    self._qtc_smooth_buffer.pop(0)
-            
-            if len(self._qtc_smooth_buffer) > 0:
-                smoothed_qtc = int(round(np.median(self._qtc_smooth_buffer)))
-            else:
-                smoothed_qtc = qtc_interval_raw if qtc_interval_raw > 0 else getattr(self, 'last_qtc_interval', 0)
-            
-            # Hold-and-jump logic for QTc
-            if not hasattr(self, '_last_displayed_qtc'):
-                self._last_displayed_qtc = smoothed_qtc
-            if not hasattr(self, '_pending_qtc_value'):
-                self._pending_qtc_value = None
-            if not hasattr(self, '_pending_qtc_start_time'):
-                self._pending_qtc_start_time = 0
-            
-            qtc_diff = abs(smoothed_qtc - self._last_displayed_qtc)
-            
-            # DEAD ZONE: Only update if change is > 5ms to prevent flickering
-            if self._last_displayed_qtc == 0 and smoothed_qtc > 0:
-                # Initial update - update immediately
-                self._last_displayed_qtc = smoothed_qtc
-                self._pending_qtc_value = None
-                qtc_interval = smoothed_qtc
-            elif qtc_diff <= 5:
-                # Change too small: Keep old value
-                qtc_interval = self._last_displayed_qtc
-                self._pending_qtc_value = None
-            elif qtc_diff <= 15:  # Small change: update immediately (allow ±15 ms jitter for QTc)
-                self._last_displayed_qtc = smoothed_qtc
-                self._pending_qtc_value = None
-                qtc_interval = smoothed_qtc
-            else:
-                # Large change: hold old value until new value is stable
-                current_time = time.time()
-                if self._pending_qtc_value is None:
-                    self._pending_qtc_value = smoothed_qtc
-                    self._pending_qtc_start_time = current_time
-                    qtc_interval = self._last_displayed_qtc
-                else:
-                    if abs(smoothed_qtc - self._pending_qtc_value) <= 10:  # Allow ±10 ms jitter
-                        if current_time - self._pending_qtc_start_time >= 0.5:  # Stable for 0.5 seconds (reduced for real-time)
-                            self._last_displayed_qtc = smoothed_qtc
-                            self._pending_qtc_value = None
-                            qtc_interval = smoothed_qtc
-                        else:
-                            qtc_interval = self._last_displayed_qtc
-                    else:
-                        # Value changed again, reset timer
-                        self._pending_qtc_value = smoothed_qtc
-                        self._pending_qtc_start_time = current_time
-                        qtc_interval = self._last_displayed_qtc
+            # No need for a second layer of smoothing and holding!
+            # qt_interval is already fully stabilized, and rr_ms comes from the stable Holter BPM.
+            # Calculating QTc directly here ensures perfect synchronization (e.g. QTc = QT exactly at 60 BPM).
+            qtc_interval = qtc_interval_raw
 
-            
             # Validation: QTc should be in reasonable range (300-500 ms typically)
             if qtc_interval < 250 or qtc_interval > 600:
                 # OPTIMIZED: Reduced print frequency for better performance
