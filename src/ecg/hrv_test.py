@@ -612,6 +612,8 @@ class HRVTestWindow(QWidget):
             bpm = self._bpm_ctrl.current_bpm()
             if bpm > 0 and hasattr(self, 'metric_labels') and 'heart_rate' in self.metric_labels:
                 self.metric_labels['heart_rate'].setText(f"{int(round(bpm))} BPM")
+                # Keep last_heart_rate in sync for report generation
+                self.last_heart_rate = int(round(bpm))
         except Exception as _e:
             print(f"[HRVTestWindow] _refresh_holter_bpm_label error: {_e}")
 
@@ -981,6 +983,13 @@ class HRVTestWindow(QWidget):
                 except Exception as e:
                     print(f" Error calculating metrics: {e}")
             
+            # Holter override for HR value to ensure PDF matches UI display perfectly
+            if hasattr(self, 'last_heart_rate') and self.last_heart_rate > 0:
+                hr_value = self.last_heart_rate
+                hr_avg = hr_value
+                if hr_max < hr_value: hr_max = hr_value
+                if hr_min > hr_value or hr_min == 0: hr_min = hr_value
+                
             # Prepare metrics data - SAME STRUCTURE AS MAIN ECG REPORT
             data = {
                 "HR": hr_value,

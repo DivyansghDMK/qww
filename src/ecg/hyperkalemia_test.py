@@ -644,6 +644,24 @@ class HyperkalemiaTestWindow(QWidget):
         self.status_label.setStyleSheet("color: #666; padding: 5px;")
         self.timer_label.setText("Time: 00:00")
 
+    def _refresh_holter_bpm_label(self):
+        """Called every 3 s by _bpm_refresh_timer.
+        Reads the stable 30-second-window BPM from HolterBPMController and
+        writes it to the heart_rate metric label.
+        Also stores the value in self.last_heart_rate so reports match the display.
+        """
+        try:
+            if self._bpm_ctrl is None or not self._bpm_ctrl.is_running:
+                return
+            bpm = self._bpm_ctrl.current_bpm()
+            if bpm > 0:
+                if hasattr(self, 'metric_labels') and 'heart_rate' in self.metric_labels:
+                    self.metric_labels['heart_rate'].setText(f"{int(round(bpm))} BPM")
+                # Always persist so report generation uses the stable Holter BPM
+                self.last_heart_rate = int(round(bpm))
+        except Exception as _e:
+            print(f"[HyperkalemiaTestWindow] _refresh_holter_bpm_label error: {_e}")
+
     def confirm_stop(self):
         reply = QMessageBox.question(
             self,
@@ -1296,7 +1314,12 @@ class HyperkalemiaTestWindow(QWidget):
                     except Exception:
                         return 0
 
-                hr = _safe_int(metrics_source.get("heart_rate", 0))
+                # Prefer the stable Holter BPM (what the display shows) over the
+                # short-window analysis_results value.
+                if hasattr(self, 'last_heart_rate') and self.last_heart_rate > 0:
+                    hr = int(self.last_heart_rate)
+                else:
+                    hr = _safe_int(metrics_source.get("heart_rate", 0))
                 pr = _safe_int(metrics_source.get("pr_interval_ms", 0))
                 qrs = _safe_int(metrics_source.get("qrs_duration_ms", 0))
                 qt = _safe_int(metrics_source.get("qt_interval_ms", 0))

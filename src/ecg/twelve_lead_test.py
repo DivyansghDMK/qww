@@ -2023,13 +2023,20 @@ class ECGTestPage(QWidget):
             else:
                 print(f" ⚠️ RR/HR inconsistency: RR={rr_ms:.1f} ms, HR={heart_rate_raw} BPM, expected RR={expected_rr:.1f} ms (diff={abs(rr_ms-expected_rr):.1f} ms)")
         
-        self.last_heart_rate = heart_rate_raw
-        
-        # FIX-HR-STAB: heart_rate_raw already comes from calculate_hr_rr()
-        # (via user_metrics) or local R-peak detection, both of which apply
-        # median + dead-zone stabilization.  Do NOT re-smooth here.
-        heart_rate = heart_rate_raw
-        self._last_displayed_hr = heart_rate
+        bpm_active = hasattr(self, '_bpm_ctrl') and self._bpm_ctrl is not None and self._bpm_ctrl.is_running
+        if not bpm_active:
+            self.last_heart_rate = heart_rate_raw
+            
+            # FIX-HR-STAB: heart_rate_raw already comes from calculate_hr_rr()
+            # (via user_metrics) or local R-peak detection, both of which apply
+            # median + dead-zone stabilization.  Do NOT re-smooth here.
+            heart_rate = heart_rate_raw
+            self._last_displayed_hr = heart_rate
+        else:
+            # We STILL want `heart_rate` to be assigned so that anything later in this function
+            # doesn't crash (though most skip local HR things if not needed).
+            heart_rate = self.last_heart_rate
+
         
         # Calculate PR Interval using atrial vector method (Lead I + aVF) - GE/Philips/Fluke standard
         # CLINICAL-GRADE: Build median beats for Lead I and aVF for atrial vector P-onset detection
