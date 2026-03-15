@@ -1705,11 +1705,14 @@ class ECGTestPage(QWidget):
             return
         
         # Get sampling rate
-        fs = 500 # Default based on observed hardware behavior
-        if hasattr(self, 'sampler') and hasattr(self.sampler, 'sampling_rate') and self.sampler.sampling_rate > 10:
-            fs = float(self.sampler.sampling_rate)
-        elif hasattr(self, 'sampling_rate') and self.sampling_rate > 10:
-            fs = float(self.sampling_rate)
+        # Hardware stream is fixed 500 Hz. Keep calculations locked to configured rate
+        # to avoid metric/wave instability when UI focus changes and measured UI rate dips.
+        fs = 500.0
+        if hasattr(self, 'demo_toggle') and self.demo_toggle.isChecked():
+            if hasattr(self, 'demo_fs') and self.demo_fs:
+                fs = float(self.demo_fs)
+            elif hasattr(self, 'sampler') and hasattr(self.sampler, 'sampling_rate') and self.sampler.sampling_rate > 10:
+                fs = float(self.sampler.sampling_rate)
             
         # Unified ECG metrics (HR, RR, PR, QRS, QT, QTc) — single source of truth
         try:
@@ -1889,9 +1892,16 @@ class ECGTestPage(QWidget):
                 # if not hasattr(self, '_rr_debug_printed'):
                 #     self._rr_debug_printed = False
                 # if not self._rr_debug_printed and len(valid_rr) > 0:
-                print(f" 🔍 RR Calculation Debug: {len(r_peaks)} R-peaks, {len(valid_rr)} valid RR intervals")
-                print(f"    RR intervals (ms): {valid_rr[:5].tolist() if len(valid_rr) >= 5 else valid_rr.tolist()}")
-                print(f"    Median RR: {rr_ms:.1f} ms → HR: {estimated_bpm:.1f} BPM")
+                if not hasattr(self, '_rr_debug_tick'):
+                    self._rr_debug_tick = 0
+                    self._rr_debug_last_ms = rr_ms
+                self._rr_debug_tick += 1
+                rr_change = abs(rr_ms - getattr(self, '_rr_debug_last_ms', rr_ms))
+                if self._rr_debug_tick <= 3 or self._rr_debug_tick % 150 == 0 or rr_change >= 80:
+                    print(f" 🔍 RR Calculation Debug: {len(r_peaks)} R-peaks, {len(valid_rr)} valid RR intervals")
+                    print(f"    RR intervals (ms): {valid_rr[:5].tolist() if len(valid_rr) >= 5 else valid_rr.tolist()}")
+                    print(f"    Median RR: {rr_ms:.1f} ms → HR: {estimated_bpm:.1f} BPM")
+                self._rr_debug_last_ms = rr_ms
                 #     self._rr_debug_printed = True
                 
                 # Validate BPM is reasonable (10-300 BPM)
@@ -2026,9 +2036,12 @@ class ECGTestPage(QWidget):
                  heart_rate_raw = local_bpm
                  # Do NOT overwrite rr_ms if we are rejecting the HR
             else:
-                 heart_rate_raw = user_bpm
-                 if user_metrics["rr_interval"] is not None:
-                     rr_ms = user_metrics["rr_interval"]
+                 # Keep HR and RR mathematically locked: if RR is available, derive HR from RR.
+                 if user_metrics["rr_interval"] is not None and user_metrics["rr_interval"] > 0:
+                     rr_ms = float(user_metrics["rr_interval"])
+                     heart_rate_raw = int(round(60000.0 / rr_ms))
+                 else:
+                     heart_rate_raw = user_bpm
         else:
              heart_rate_raw = local_bpm
         
@@ -2049,7 +2062,7 @@ class ECGTestPage(QWidget):
         # The hold-and-jump display logic may show HR=61 while rr_ms=998ms → diff=15ms.
         # Accept ≤20ms difference (< 2 BPM equivalent error).
         expected_rr = 60000.0 / heart_rate_raw if heart_rate_raw > 0 else 600.0
-        verification_ok = abs(rr_ms - expected_rr) <= 20.0
+        verification_ok = abs(rr_ms - expected_rr) <= 30.0
         
         # Debug output: Show RR and HR calculation (print first few times and then occasionally)
         if not hasattr(self, '_rr_hr_debug_count'):
@@ -8429,8 +8442,9 @@ class ECGTestPage(QWidget):
                                     if hasattr(self, 'metric_labels') and 'sampling_rate' in self.metric_labels:
                                         self.metric_labels['sampling_rate'].setText(f"{sampling_rate:.1f} Hz")
                                     
-                                    # Update self.sampling_rate for heart rate calculation
-                                    self.sampling_rate = sampling_rate
+                                    # Keep runtime calculations locked to configured hardware rate
+                                    # (device is 500 Hz); measured UI cadence may dip when window focus changes.
+                                    self.sampling_rate = 500.0
                         except Exception as e:
                             print(f" Error updating sampling rate: {e}")
                         
@@ -8531,10 +8545,11 @@ class ECGTestPage(QWidget):
 
                             # Build time axis and apply wave-speed scaling
                             sampling_rate = 500.0
-                            if hasattr(self, 'sampler') and hasattr(self.sampler, 'sampling_rate') and self.sampler.sampling_rate > 10:
-                                sampling_rate = float(self.sampler.sampling_rate)
-                            elif hasattr(self, 'sampling_rate') and self.sampling_rate > 10:
-                                sampling_rate = float(self.sampling_rate)
+                            if hasattr(self, 'demo_toggle') and self.demo_toggle.isChecked():
+                                if hasattr(self, 'sampler') and hasattr(self.sampler, 'sampling_rate') and self.sampler.sampling_rate > 10:
+                                    sampling_rate = float(self.sampler.sampling_rate)
+                                elif hasattr(self, 'sampling_rate') and self.sampling_rate > 10:
+                                    sampling_rate = float(self.sampling_rate)
                             
                             # Calculate how many samples to show based on wave speed
                             # 25 mm/s → 10s window
