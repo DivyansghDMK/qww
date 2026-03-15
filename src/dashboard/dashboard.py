@@ -3123,7 +3123,7 @@ class Dashboard(QWidget):
                       background QThread so the ECG wave plots keep scrolling smoothly
                       with zero UI lag / "dhakke".
         """
-        from PyQt5.QtWidgets import QFileDialog, QMessageBox
+        from PyQt5.QtWidgets import QMessageBox
         from PyQt5.QtCore import QThread, pyqtSignal, QObject
         import datetime
         import os
@@ -3252,8 +3252,7 @@ class Dashboard(QWidget):
             "HR_avg": HR  if HR  > 0 else 88,
         }
 
-        # ── STEP 2: Ask user where to save BEFORE starting background work ──
-        # QFileDialog must run on the main thread.
+        # ── STEP 2: Prepare output path BEFORE starting background work (non-modal) ──
         from ecg.ecg_report_generator import generate_ecg_report
         try:
             from ecg.demo_ecg_report_generator import generate_demo_ecg_report
@@ -3263,15 +3262,14 @@ class Dashboard(QWidget):
             from dashboard.history_window import append_history_entry
         except Exception:
             append_history_entry = None
-
-        filename, _ = QFileDialog.getSaveFileName(
-            self,
-            "Save ECG Report",
-            f"ECG_Report_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
-            "PDF Files (*.pdf)"
-        )
-        if not filename:
-            return  # User cancelled
+        # Non-blocking output path (no QFileDialog) to avoid UI pause/deformation while ECG is live.
+        report_stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        default_name = f"ECG_Report_12_1_{report_stamp}.pdf"
+        downloads_dir = os.path.join(os.path.expanduser('~'), 'Downloads')
+        if not os.path.isdir(downloads_dir):
+            downloads_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'reports'))
+        os.makedirs(downloads_dir, exist_ok=True)
+        filename = os.path.join(downloads_dir, default_name)
 
         # Load patient data (fast, JSON read — OK on main thread)
         patient = None
@@ -3557,10 +3555,8 @@ class Dashboard(QWidget):
                 self.refresh_recent_reports_ui()
             except Exception:
                 pass
-            QMessageBox.information(
-                self, "Success",
-                f" ECG Report generated successfully!\n Saved as: {fname}"
-            )
+            # Keep flow non-modal to avoid disturbing live ECG painting.
+            print(f"✅ ECG Report generated successfully: {fname}")
 
         def _on_failed(err):
             self._report_thread.quit()
