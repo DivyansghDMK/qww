@@ -2468,7 +2468,13 @@ class ECGTestPage(QWidget):
         This function is called with self.data[1] which contains raw ECG values.
         """
         sampler = getattr(self, 'sampler', None)
-        sampling_rate = getattr(self, 'sampling_rate', 500.0)
+        # Keep BPM locked to the device's configured hardware rate in live mode.
+        # The measured UI cadence can drift in the exe build when the event loop is
+        # busy or the window loses focus, and using that transient rate makes BPM
+        # appear to jump between systems even though the ECG signal is unchanged.
+        sampling_rate = 500.0
+        if hasattr(self, 'demo_toggle') and self.demo_toggle.isChecked():
+            sampling_rate = getattr(self, 'sampling_rate', 500.0)
         # Use instance id for per-instance smoothing (prevents cross-contamination)
         instance_id = id(self) if hasattr(self, '__class__') else 'ecg_test_page'
         return calculate_heart_rate_from_signal(lead_data, sampling_rate=sampling_rate, sampler=sampler, instance_id=instance_id)
@@ -4247,7 +4253,9 @@ class ECGTestPage(QWidget):
             # Detect R peaks using Pan-Tompkins algorithm
             # Use detected sampling rate - Fixed Bug QRS-2 (fs=186.5 hardcoded)
             fs_report = 500.0
-            if hasattr(self, 'sampler') and hasattr(self.sampler, 'sampling_rate') and self.sampler.sampling_rate > 10:
+            if (hasattr(self, 'demo_toggle') and self.demo_toggle.isChecked()
+                    and hasattr(self, 'sampler') and hasattr(self.sampler, 'sampling_rate')
+                    and self.sampler.sampling_rate > 10):
                 fs_report = float(self.sampler.sampling_rate)
 
             # Detect R peaks using Pan-Tompkins algorithm

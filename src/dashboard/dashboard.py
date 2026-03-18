@@ -2197,10 +2197,17 @@ class Dashboard(QWidget):
             is_windows = platform.system() == 'Windows'
             platform_tag = "[Windows]" if is_windows else "[macOS/Linux]"
             
-            fs = 500.0  # Base fallback (matches ECG test page - unified across platforms)
+            fs = 500.0  # Hardware stream rate for live acquisition
+            demo_mode_active = bool(
+                hasattr(self, 'ecg_test_page')
+                and self.ecg_test_page
+                and hasattr(self.ecg_test_page, 'demo_toggle')
+                and self.ecg_test_page.demo_toggle.isChecked()
+            )
+
             if sampling_rate and sampling_rate > 10:
                 fs = float(sampling_rate)
-            elif hasattr(self, 'ecg_test_page') and self.ecg_test_page:
+            elif demo_mode_active and hasattr(self, 'ecg_test_page') and self.ecg_test_page:
                 try:
                     if hasattr(self.ecg_test_page, 'sampler') and hasattr(self.ecg_test_page.sampler, 'sampling_rate'):
                         if self.ecg_test_page.sampler.sampling_rate > 10:
@@ -2220,7 +2227,8 @@ class Dashboard(QWidget):
             # Windows-specific warnings
             if is_windows and fs == 500.0:
                 if self._calc_count <= 5:
-                    print(f" {platform_tag} Sampling rate detection failed, using fallback 500.0 Hz")
+                    reason = "demo detector unavailable" if demo_mode_active else "live hardware locked to configured 500.0 Hz"
+                    print(f" {platform_tag} Using 500.0 Hz ({reason})")
             
             # Validation
             if fs <= 0 or not np.isfinite(fs):
